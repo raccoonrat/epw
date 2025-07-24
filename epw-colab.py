@@ -36,11 +36,9 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
     This makes the expert choices accessible for the watermarking processor.
     """
     def forward(self, *args, **kwargs):
-        # =============================================================================
         # FIX: A more robust fix for the internal load balancing loss error.
         # We temporarily monkey-patch the problematic function with a dummy that
         # returns a zero tensor. This is safe during inference as the loss is not used.
-        # =============================================================================
         original_load_balancing_loss_func = modeling_mixtral.load_balancing_loss_func
         modeling_mixtral.load_balancing_loss_func = lambda *a, **kw: torch.tensor(0.0, device=self.device)
         
@@ -163,7 +161,11 @@ class WatermarkDetector:
         # --- REAL PATH RECONSTRUCTION USING HOOKS ---
         expert_choices = []
         def hook_fn(module, args, output):
-            router_logits = output[0]
+            # =========================================================================
+            # FIX: The output of the gate layer is the tensor itself, not a tuple.
+            # This was the cause of the token/choice mismatch error.
+            # =========================================================================
+            router_logits = output
             choices = torch.argmax(router_logits, dim=-1).squeeze().tolist()
             if isinstance(choices, int):
                 choices = [choices]
@@ -185,6 +187,8 @@ class WatermarkDetector:
             for handle in handles:
                 handle.remove()
 
+        # The hooks are called for each MoE layer. We only need the path from one layer.
+        # Here, we use the path from the last MoE layer.
         num_layers_with_moe = len(handles)
         last_layer_expert_path = expert_choices[-num_tokens:]
 
