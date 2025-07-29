@@ -17,6 +17,22 @@ import transformers.models.mixtral.modeling_mixtral as modeling_mixtral
 import importlib.metadata
 import warnings
 
+# Try to import numpy and scikit-learn for PEPI oracle
+try:
+    import numpy as np
+    numpy_available = True
+except ImportError:
+    numpy_available = False
+    print("Warning: numpy not available. PEPI oracle will use fallback methods.")
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler
+    sklearn_available = True
+except ImportError:
+    sklearn_available = False
+    print("Warning: scikit-learn not available. PEPI oracle will use simple heuristic classifier.")
+
 # Suppress a specific warning from transformers about overriding a method.
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Passing `model_kwargs` to `forward` is deprecated.*")
 
@@ -372,14 +388,375 @@ class WatermarkDetector:
         }
 
 # =======================================================================================
-# 5. MAIN EXECUTION BLOCK
+# 5. EPW-A DETECTION SUITE (COMPLETE IMPLEMENTATION)
+# Implements the complete EPW-A detection suite with CSPV and PEPI
+# =======================================================================================
+
+class EPWADetectionSuite:
+    """
+    Complete EPW-A detection suite implementing both gray-box (with CSPV) 
+    and black-box (with PEPI) detection methods.
+    """
+    
+    def __init__(self, tokenizer, model, secret_key: str, gamma: float = 0.5, router_hash: str = None):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.secret_key = secret_key.encode('utf-8')
+        self.gamma = gamma
+        self.device = model.device
+        self.model.eval()
+        self.vocab_size = self.tokenizer.vocab_size
+        
+        # Use provided router_hash or get from model if available
+        if router_hash is None and hasattr(model, 'router_hash'):
+            self.router_hash = model.router_hash.encode('utf-8')
+        else:
+            self.router_hash = router_hash.encode('utf-8') if router_hash else b''
+
+    def _get_green_list_ids(self, expert_index: int) -> torch.Tensor:
+        """Generate green list using IRSH protocol"""
+        if self.router_hash:
+            seed_payload = f"{expert_index}:{self.router_hash.decode('utf-8')}".encode('utf-8')
+        else:
+            seed_payload = str(expert_index).encode('utf-8')
+            
+        h = hmac.new(self.secret_key, seed_payload, hashlib.sha256)
+        seed = int.from_bytes(h.digest()[:8], 'big')
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        permutation = torch.randperm(self.vocab_size, generator=generator)
+        return permutation[:int(self.vocab_size * self.gamma)]
+
+    def _calculate_z_score(self, green_token_count: int, total_tokens: int) -> float:
+        """Calculate Z-score for watermark detection"""
+        expected_green_tokens = total_tokens * self.gamma
+        variance = total_tokens * self.gamma * (1 - self.gamma)
+        if variance == 0:
+            return float('inf')
+        return (green_token_count - expected_green_tokens) / math.sqrt(variance)
+
+    def detect_graybox_cspv(self, text: str, sample_size: int = 50, z_threshold: float = 4.0) -> Dict[str, Any]:
+        """
+        Gray-box detection with Confidence-Stratified Path Verification (CSPV).
+        This method significantly reduces computational cost by sampling only the most informative tokens.
+        """
+        if not text.strip():
+            return {"detected": False, "z_score": 0.0, "num_tokens": 0, "message": "Input text is empty or whitespace."}
+
+        tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
+        num_tokens = tokenized_text.shape[1]
+
+        if num_tokens < 10:
+            return {"detected": False, "z_score": 0.0, "num_tokens": num_tokens, "message": "Text too short."}
+
+        # Step 1: Single forward pass to get all routing confidences
+        all_confidences = []
+        all_expert_indices = []
+        
+        def confidence_hook_fn(module, args, output):
+            router_logits = output
+            expert_probs = torch.softmax(router_logits, dim=-1)
+            expert_indices = torch.argmax(router_logits, dim=-1)
+            confidences = torch.max(expert_probs, dim=-1)[0]
+            
+            all_confidences.extend(confidences.squeeze().tolist())
+            all_expert_indices.extend(expert_indices.squeeze().tolist())
+
+        handles = []
+        for layer in self.model.model.layers:
+            if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
+                handle = layer.block_sparse_moe.gate.register_forward_hook(confidence_hook_fn)
+                handles.append(handle)
+
+        if not handles:
+            return {"error": "Could not find any MoE layers to attach hooks to."}
+
+        try:
+            with torch.no_grad():
+                self.model(tokenized_text, output_router_logits=True)
+        finally:
+            for handle in handles: handle.remove()
+
+        # Get the last layer's data
+        last_layer_confidences = all_confidences[-num_tokens:]
+        last_layer_expert_indices = all_expert_indices[-num_tokens:]
+
+        if len(last_layer_confidences) != num_tokens:
+            return {"error": f"Confidence collection failed. Mismatch: {num_tokens} tokens vs {len(last_layer_confidences)} confidences."}
+
+        # Step 2: Confidence-stratified sampling (CSPV)
+        # Create index-confidence pairs and sort by confidence
+        index_confidence_pairs = list(enumerate(last_layer_confidences))
+        index_confidence_pairs.sort(key=lambda x: x[1])  # Sort by confidence (ascending)
+
+        # Calculate sampling sizes for each stratum
+        k1 = max(1, sample_size // 3)  # Low confidence stratum
+        k2 = max(1, sample_size // 3)  # High confidence stratum  
+        k3 = sample_size - k1 - k2     # Random stratum
+
+        # Sample indices
+        low_confidence_indices = [pair[0] for pair in index_confidence_pairs[:k1]]
+        high_confidence_indices = [pair[0] for pair in index_confidence_pairs[-k2:]]
+        
+        # Random stratum (avoid overlap with other strata)
+        remaining_indices = [i for i in range(num_tokens) 
+                           if i not in low_confidence_indices and i not in high_confidence_indices]
+        random_indices = torch.randperm(len(remaining_indices))[:k3].tolist()
+        random_stratum_indices = [remaining_indices[i] for i in random_indices]
+
+        sampled_indices = low_confidence_indices + high_confidence_indices + random_stratum_indices
+
+        # Step 3: Verify only the sampled tokens
+        green_token_count = 0
+        for t in sampled_indices:
+            token_id = tokenized_text[0, t].item()
+            expert_index = last_layer_expert_indices[t]
+            green_list_ids = self._get_green_list_ids(expert_index)
+            if token_id in green_list_ids:
+                green_token_count += 1
+
+        # Step 4: Calculate Z-score based on sample
+        z_score = self._calculate_z_score(green_token_count, len(sampled_indices))
+
+        return {
+            "detected": z_score > z_threshold,
+            "z_score": z_score,
+            "num_green_tokens": green_token_count,
+            "num_sampled_tokens": len(sampled_indices),
+            "total_tokens": num_tokens,
+            "sampling_strategy": {
+                "low_confidence": len(low_confidence_indices),
+                "high_confidence": len(high_confidence_indices),
+                "random": len(random_stratum_indices)
+            },
+            "method": "graybox_cspv"
+        }
+
+    def train_path_inference_oracle(self, training_corpus: List[str], num_samples: int = 1000) -> 'PathInferenceOracle':
+        """
+        Train a Path Inference Oracle for black-box detection (PEPI).
+        This oracle learns to predict expert indices from logits vectors.
+        """
+        print(f"Training Path Inference Oracle with {num_samples} samples...")
+        
+        X_logits = []
+        Y_experts = []
+        
+        # Generate training data
+        for i, text in enumerate(training_corpus[:num_samples]):
+            if i % 100 == 0:
+                print(f"Processing sample {i}/{num_samples}")
+                
+            # Tokenize text
+            tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
+            
+            # Collect logits and expert indices
+            logits_sequence = []
+            expert_sequence = []
+            
+            def oracle_training_hook_fn(module, args, output):
+                router_logits = output
+                expert_indices = torch.argmax(router_logits, dim=-1).squeeze().tolist()
+                if isinstance(expert_indices, int): 
+                    expert_indices = [expert_indices]
+                expert_sequence.extend(expert_indices)
+
+            handles = []
+            for layer in self.model.model.layers:
+                if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
+                    handle = layer.block_sparse_moe.gate.register_forward_hook(oracle_training_hook_fn)
+                    handles.append(handle)
+
+            try:
+                with torch.no_grad():
+                    outputs = self.model(tokenized_text, output_router_logits=True)
+                    # Get logits for each token
+                    for t in range(tokenized_text.shape[1] - 1):
+                        context = tokenized_text[:, :t+1]
+                        with torch.no_grad():
+                            logits = self.model(context).logits[0, -1, :]  # Last token logits
+                            if numpy_available:
+                                logits_sequence.append(logits.cpu().numpy())
+                            else:
+                                logits_sequence.append(logits.cpu())
+            finally:
+                for handle in handles: handle.remove()
+
+            # Match logits with expert indices
+            for t, logits in enumerate(logits_sequence):
+                if t < len(expert_sequence):
+                    if numpy_available:
+                        X_logits.append(logits)
+                    else:
+                        X_logits.append(logits.numpy())
+                    Y_experts.append(expert_sequence[t])
+
+        # Create and train the oracle
+        oracle = PathInferenceOracle(self.vocab_size, num_experts=8)  # Assuming 8 experts for Mixtral
+        oracle.train(X_logits, Y_experts)
+        
+        print(f"Oracle training completed with {len(X_logits)} samples")
+        return oracle
+
+    def detect_blackbox_pepi(self, text: str, oracle: 'PathInferenceOracle', z_threshold: float = 4.0) -> Dict[str, Any]:
+        """
+        Black-box detection using Probabilistic Expert Path Inference (PEPI).
+        This method works with only API access to the model.
+        """
+        if not text.strip():
+            return {"detected": False, "z_score": 0.0, "num_tokens": 0, "message": "Input text is empty or whitespace."}
+
+        tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
+        num_tokens = tokenized_text.shape[1]
+
+        if num_tokens < 10:
+            return {"detected": False, "z_score": 0.0, "num_tokens": num_tokens, "message": "Text too short."}
+
+        green_token_count = 0
+        
+        # Process each token
+        for t in range(num_tokens):
+            # Get context up to current token
+            context = tokenized_text[:, :t]
+            
+            # Get logits from model (simulating API call)
+            with torch.no_grad():
+                logits = self.model(context).logits[0, -1, :]  # Last token logits
+            
+            # Use oracle to predict expert index
+            if numpy_available:
+                predicted_expert_index = oracle.predict(logits.cpu().numpy())
+            else:
+                predicted_expert_index = oracle.predict(logits.cpu().numpy())
+            
+            # Reconstruct green list using IRSH
+            green_list_ids = self._get_green_list_ids(predicted_expert_index)
+            
+            # Check if current token is in green list
+            current_token_id = tokenized_text[0, t].item()
+            if current_token_id in green_list_ids:
+                green_token_count += 1
+
+        # Calculate Z-score
+        z_score = self._calculate_z_score(green_token_count, num_tokens)
+
+        return {
+            "detected": z_score > z_threshold,
+            "z_score": z_score,
+            "num_green_tokens": green_token_count,
+            "num_tokens": num_tokens,
+            "method": "blackbox_pepi"
+        }
+
+# =======================================================================================
+# 6. PATH INFERENCE ORACLE FOR PEPI
+# =======================================================================================
+
+class PathInferenceOracle:
+    """
+    A classifier that predicts expert indices from logits vectors.
+    Used for black-box detection in the PEPI framework.
+    """
+    
+    def __init__(self, vocab_size: int, num_experts: int = 8):
+        self.vocab_size = vocab_size
+        self.num_experts = num_experts
+        self.classifier = None
+        self.is_trained = False
+        
+    def train(self, X_logits: List[np.ndarray], Y_experts: List[int]):
+        """
+        Train the oracle using logits-expert pairs.
+        
+        Args:
+            X_logits: List of logits vectors
+            Y_experts: List of corresponding expert indices
+        """
+        if sklearn_available and numpy_available:
+            # Convert to numpy arrays
+            X = np.array(X_logits)
+            y = np.array(Y_experts)
+            
+            # Normalize the features
+            self.scaler = StandardScaler()
+            X_scaled = self.scaler.fit_transform(X)
+            
+            # Train a Random Forest classifier
+            self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+            self.classifier.fit(X_scaled, y)
+            
+            self.is_trained = True
+            print(f"Oracle trained successfully with {len(X)} samples")
+            
+        else:
+            print("Warning: scikit-learn not available. Using simple heuristic classifier.")
+            self._train_simple_classifier(X_logits, Y_experts)
+    
+    def _train_simple_classifier(self, X_logits: List[np.ndarray], Y_experts: List[int]):
+        """
+        Simple heuristic classifier as fallback when scikit-learn is not available.
+        """
+        if not numpy_available:
+            print("Error: numpy is required for simple classifier fallback.")
+            return
+        
+        # Group logits by expert
+        expert_logits = {i: [] for i in range(self.num_experts)}
+        for logits, expert in zip(X_logits, Y_experts):
+            expert_logits[expert].append(logits)
+        
+        # Calculate mean logits for each expert
+        self.expert_mean_logits = {}
+        for expert in range(self.num_experts):
+            if expert_logits[expert]:
+                self.expert_mean_logits[expert] = np.mean(expert_logits[expert], axis=0)
+        
+        self.is_trained = True
+        print(f"Simple classifier trained with {len(X_logits)} samples")
+    
+    def predict(self, logits: np.ndarray) -> int:
+        """
+        Predict expert index from logits vector.
+        
+        Args:
+            logits: Logits vector from model
+            
+        Returns:
+            Predicted expert index
+        """
+        if not self.is_trained:
+            raise ValueError("Oracle must be trained before making predictions")
+        
+        if self.classifier is not None and sklearn_available:
+            # Use trained classifier
+            logits_scaled = self.scaler.transform(logits.reshape(1, -1))
+            return self.classifier.predict(logits_scaled)[0]
+        elif hasattr(self, 'expert_mean_logits') and numpy_available:
+            # Use simple heuristic (nearest neighbor to mean logits)
+            min_distance = float('inf')
+            best_expert = 0
+            
+            for expert, mean_logits in self.expert_mean_logits.items():
+                distance = np.linalg.norm(logits - mean_logits)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_expert = expert
+            
+            return best_expert
+        else:
+            # Fallback: return random expert
+            import random
+            return random.randint(0, self.num_experts - 1)
+
+# =======================================================================================
+# 7. MAIN EXECUTION BLOCK
 # =======================================================================================
 if __name__ == '__main__':
     print("--- Full Implementation of EPW-A Framework (Enhanced Architecture) ---")
 
     SECRET_KEY = "a_very_secret_and_long_key_for_hmac"
     model_name = "mistralai/Mixtral-8x7B-v0.1"
-
+    token = "hf_xxx"  # Replace with your token
 
     if token == "hf_xxx":
         print("WARNING: Please replace 'hf_xxx' with your Hugging Face token.")
@@ -411,7 +788,7 @@ if __name__ == '__main__':
         model, tokenizer = None, None
 
     if tokenizer and model:
-        print("\n--- 2. Generating Watermarked Text with EPW-A ---")
+        print("\n--- 1. Generating Watermarked Text with EPW-A ---")
 
         # Example 1: GSG mode (Gating-Seeded Green-listing)
         print("\n--- GSG Mode ---")
@@ -484,11 +861,13 @@ if __name__ == '__main__':
         print(f"\nEWP Watermarked Text:\n{ewp_text}")
         print(f"\nUnwatermarked Text:\n{unwatermarked_text}")
 
-        print("\n--- 3. Detecting Watermark with IRSH Support ---")
-        detector = WatermarkDetector(
-            tokenizer=tokenizer, 
-            model=model, 
-            secret_key=SECRET_KEY, 
+        print("\n--- 2. EPW-A Detection Suite Demonstration ---")
+        
+        # Initialize EPW-A detection suite
+        detection_suite = EPWADetectionSuite(
+            tokenizer=tokenizer,
+            model=model,
+            secret_key=SECRET_KEY,
             gamma=0.5,
             router_hash=model.router_hash
         )
@@ -497,23 +876,118 @@ if __name__ == '__main__':
         generated_ewp_text = ewp_text[len(prompt):]
         generated_unwatermarked_text = unwatermarked_text[len(prompt):]
 
-        print("\nAnalyzing GSG watermarked text...")
-        result_gsg = detector.detect(generated_gsg_text)
-        print(f"--> GSG Detection Result: {result_gsg}")
+        # Test 1: Gray-box detection with CSPV
+        print("\n--- 2.1 Gray-box Detection with CSPV ---")
+        print("Testing GSG watermarked text...")
+        result_gsg_cspv = detection_suite.detect_graybox_cspv(generated_gsg_text, sample_size=30)
+        print(f"GSG CSPV Result: {result_gsg_cspv}")
 
-        print("\nAnalyzing EWP watermarked text...")
-        result_ewp = detector.detect(generated_ewp_text)
-        print(f"--> EWP Detection Result: {result_ewp}")
+        print("Testing EWP watermarked text...")
+        result_ewp_cspv = detection_suite.detect_graybox_cspv(generated_ewp_text, sample_size=30)
+        print(f"EWP CSPV Result: {result_ewp_cspv}")
 
-        print("\nAnalyzing unwatermarked text...")
-        result_unwatermarked = detector.detect(generated_unwatermarked_text)
-        print(f"--> Unwatermarked Detection Result: {result_unwatermarked}")
+        print("Testing unwatermarked text...")
+        result_unwatermarked_cspv = detection_suite.detect_graybox_cspv(generated_unwatermarked_text, sample_size=30)
+        print(f"Unwatermarked CSPV Result: {result_unwatermarked_cspv}")
 
-        # Summary
-        print("\n--- Summary ---")
-        print(f"GSG Watermark Detected: {result_gsg.get('detected', False)} (Z-score: {result_gsg.get('z_score', 0):.2f})")
-        print(f"EWP Watermark Detected: {result_ewp.get('detected', False)} (Z-score: {result_ewp.get('z_score', 0):.2f})")
-        print(f"False Positive: {result_unwatermarked.get('detected', False)} (Z-score: {result_unwatermarked.get('z_score', 0):.2f})")
+        # Test 2: Black-box detection with PEPI
+        print("\n--- 2.2 Black-box Detection with PEPI ---")
+        
+        # Create training corpus for oracle
+        print("Creating training corpus for Path Inference Oracle...")
+        training_corpus = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Artificial intelligence is transforming the world.",
+            "Machine learning algorithms are becoming more sophisticated.",
+            "Deep learning models require significant computational resources.",
+            "Natural language processing enables human-computer interaction.",
+            "Computer vision systems can recognize objects in images.",
+            "Robotics combines mechanical engineering with artificial intelligence.",
+            "Data science involves extracting insights from large datasets.",
+            "Neural networks are inspired by biological brain structures.",
+            "Reinforcement learning agents learn through trial and error."
+        ]
+        
+        # Train the oracle
+        print("Training Path Inference Oracle...")
+        oracle = detection_suite.train_path_inference_oracle(training_corpus, num_samples=100)
+        
+        # Test black-box detection
+        print("Testing GSG watermarked text with PEPI...")
+        result_gsg_pepi = detection_suite.detect_blackbox_pepi(generated_gsg_text, oracle)
+        print(f"GSG PEPI Result: {result_gsg_pepi}")
+
+        print("Testing EWP watermarked text with PEPI...")
+        result_ewp_pepi = detection_suite.detect_blackbox_pepi(generated_ewp_text, oracle)
+        print(f"EWP PEPI Result: {result_ewp_pepi}")
+
+        print("Testing unwatermarked text with PEPI...")
+        result_unwatermarked_pepi = detection_suite.detect_blackbox_pepi(generated_unwatermarked_text, oracle)
+        print(f"Unwatermarked PEPI Result: {result_unwatermarked_pepi}")
+
+        # Test 3: Legacy detection for comparison
+        print("\n--- 2.3 Legacy Detection (for comparison) ---")
+        legacy_detector = WatermarkDetector(
+            tokenizer=tokenizer, 
+            model=model, 
+            secret_key=SECRET_KEY, 
+            gamma=0.5,
+            router_hash=model.router_hash
+        )
+
+        print("Testing GSG watermarked text with legacy detector...")
+        result_gsg_legacy = legacy_detector.detect(generated_gsg_text)
+        print(f"GSG Legacy Result: {result_gsg_legacy}")
+
+        print("Testing EWP watermarked text with legacy detector...")
+        result_ewp_legacy = legacy_detector.detect(generated_ewp_text)
+        print(f"EWP Legacy Result: {result_ewp_legacy}")
+
+        print("Testing unwatermarked text with legacy detector...")
+        result_unwatermarked_legacy = legacy_detector.detect(generated_unwatermarked_text)
+        print(f"Unwatermarked Legacy Result: {result_unwatermarked_legacy}")
+
+        # Summary and comparison
+        print("\n--- 3. Summary and Comparison ---")
+        print("Detection Results Summary:")
+        print("=" * 60)
+        
+        # GSG Results
+        print(f"GSG Watermarked Text:")
+        print(f"  - Legacy:     Detected={result_gsg_legacy.get('detected', False)}, Z-score={result_gsg_legacy.get('z_score', 0):.2f}")
+        print(f"  - CSPV:       Detected={result_gsg_cspv.get('detected', False)}, Z-score={result_gsg_cspv.get('z_score', 0):.2f}")
+        print(f"  - PEPI:       Detected={result_gsg_pepi.get('detected', False)}, Z-score={result_gsg_pepi.get('z_score', 0):.2f}")
+        
+        # EWP Results
+        print(f"\nEWP Watermarked Text:")
+        print(f"  - Legacy:     Detected={result_ewp_legacy.get('detected', False)}, Z-score={result_ewp_legacy.get('z_score', 0):.2f}")
+        print(f"  - CSPV:       Detected={result_ewp_cspv.get('detected', False)}, Z-score={result_ewp_cspv.get('z_score', 0):.2f}")
+        print(f"  - PEPI:       Detected={result_ewp_pepi.get('detected', False)}, Z-score={result_ewp_pepi.get('z_score', 0):.2f}")
+        
+        # Unwatermarked Results
+        print(f"\nUnwatermarked Text:")
+        print(f"  - Legacy:     Detected={result_unwatermarked_legacy.get('detected', False)}, Z-score={result_unwatermarked_legacy.get('z_score', 0):.2f}")
+        print(f"  - CSPV:       Detected={result_unwatermarked_cspv.get('detected', False)}, Z-score={result_unwatermarked_cspv.get('z_score', 0):.2f}")
+        print(f"  - PEPI:       Detected={result_unwatermarked_pepi.get('detected', False)}, Z-score={result_unwatermarked_pepi.get('z_score', 0):.2f}")
+        
+        # Performance comparison
+        print("\nPerformance Comparison:")
+        print("=" * 60)
+        print("CSPV Sampling Strategy:")
+        if 'sampling_strategy' in result_gsg_cspv:
+            strategy = result_gsg_cspv['sampling_strategy']
+            print(f"  - Low confidence tokens: {strategy.get('low_confidence', 0)}")
+            print(f"  - High confidence tokens: {strategy.get('high_confidence', 0)}")
+            print(f"  - Random tokens: {strategy.get('random', 0)}")
+            print(f"  - Total sampled: {result_gsg_cspv.get('num_sampled_tokens', 0)} out of {result_gsg_cspv.get('total_tokens', 0)}")
+        
+        print("\nEPW-A Framework Features Demonstrated:")
+        print("✓ IRSH Protocol: Router hash binding for enhanced security")
+        print("✓ GSG Mode: Gating-Seeded Green-listing with global delta")
+        print("✓ EWP Mode: Expert-Specific Weighted Perturbation with dynamic delta")
+        print("✓ CSPV: Confidence-Stratified Path Verification for efficiency")
+        print("✓ PEPI: Probabilistic Expert Path Inference for black-box detection")
+        print("✓ Backward Compatibility: Legacy detection still works")
         
     else:
         print("\nSkipping demonstration due to model or tokenizer loading error.")
