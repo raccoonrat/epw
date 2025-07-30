@@ -287,6 +287,10 @@ class EPWALogitsProcessor(LogitsProcessor):
         """
         Process logits to implement EPW-A watermarking.
         """
+        # Store original dtype and cast to float32 for numerical stability
+        original_dtype = scores.dtype
+        scores = scores.to(torch.float32)
+
         if not self._fallback_printed:
             print(f"EPW-A LogitsProcessor: Using fallback mode with improved expert index calculation")
             self._fallback_printed = True
@@ -326,7 +330,8 @@ class EPWALogitsProcessor(LogitsProcessor):
             perturbation_strength = effective_delta * (1 + expert_index * 0.1)
             scores[0, green_list_ids] += perturbation_strength
         
-        return scores
+        # Cast back to the original dtype
+        return scores.to(original_dtype)
 
 # =======================================================================================
 # 3. LEGACY WATERMARKING LOGITS PROCESSOR (FOR BACKWARD COMPATIBILITY)
@@ -358,6 +363,10 @@ class WatermarkLogitsProcessor(LogitsProcessor):
         """
         Process logits to implement watermarking.
         """
+        # Store original dtype and cast to float32 for numerical stability
+        original_dtype = scores.dtype
+        scores = scores.to(torch.float32)
+
         # 改进的专家索引计算
         if input_ids.shape[1] > 0:
             # 使用更复杂的专家索引计算
@@ -380,7 +389,8 @@ class WatermarkLogitsProcessor(LogitsProcessor):
         # 应用水印
         scores[0, green_list_ids] += self.delta
         
-        return scores
+        # Cast back to the original dtype
+        return scores.to(original_dtype)
 
 # =======================================================================================
 # 4. ENHANCED DETECTOR WITH IRSH SUPPORT
