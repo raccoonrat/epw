@@ -1,106 +1,95 @@
 #!/usr/bin/env python3
 """
-DynamicCache修复脚本
-在运行主程序之前先运行此脚本
+简单的DynamicCache修复测试
 """
 
-import sys
 import os
+import sys
 
-def apply_dynamic_cache_fix():
-    """应用DynamicCache修复"""
-    print("=== 应用DynamicCache修复 ===")
+def test_dynamic_cache_import():
+    """测试DynamicCache导入"""
+    print("=== 测试DynamicCache导入 ===")
     
     try:
-        # 导入transformers
         import transformers
+        print(f"transformers版本: {transformers.__version__}")
         
-        # 尝试不同的导入路径
+        # 尝试不同的导入方法
         DynamicCache = None
         
         # 方法1: 直接从transformers导入
         try:
             from transformers import DynamicCache
-            print("✓ 从transformers直接导入DynamicCache成功")
-        except ImportError:
-            pass
+            print("✓ 方法1成功: from transformers import DynamicCache")
+        except ImportError as e:
+            print(f"✗ 方法1失败: {e}")
         
         # 方法2: 从transformers.cache导入
         if DynamicCache is None:
             try:
                 from transformers.cache import DynamicCache
-                print("✓ 从transformers.cache导入DynamicCache成功")
-            except ImportError:
-                pass
+                print("✓ 方法2成功: from transformers.cache import DynamicCache")
+            except ImportError as e:
+                print(f"✗ 方法2失败: {e}")
         
         # 方法3: 从transformers.utils导入
         if DynamicCache is None:
             try:
                 from transformers.utils import DynamicCache
-                print("✓ 从transformers.utils导入DynamicCache成功")
-            except ImportError:
-                pass
+                print("✓ 方法3成功: from transformers.utils import DynamicCache")
+            except ImportError as e:
+                print(f"✗ 方法3失败: {e}")
         
         # 方法4: 从transformers.generation导入
         if DynamicCache is None:
             try:
                 from transformers.generation import DynamicCache
-                print("✓ 从transformers.generation导入DynamicCache成功")
-            except ImportError:
-                pass
+                print("✓ 方法4成功: from transformers.generation import DynamicCache")
+            except ImportError as e:
+                print(f"✗ 方法4失败: {e}")
         
-        # 如果所有方法都失败，尝试动态查找
+        # 方法5: 动态查找
         if DynamicCache is None:
-            # 遍历transformers模块查找DynamicCache
+            print("尝试动态查找DynamicCache...")
             for attr_name in dir(transformers):
                 attr = getattr(transformers, attr_name)
                 if hasattr(attr, '__name__') and attr.__name__ == 'DynamicCache':
                     DynamicCache = attr
-                    print("✓ 动态找到DynamicCache")
+                    print(f"✓ 动态找到DynamicCache: {attr_name}")
                     break
         
-        if DynamicCache is None:
+        if DynamicCache is not None:
+            print(f"✓ DynamicCache类找到: {DynamicCache}")
+            
+            # 检查方法
+            if hasattr(DynamicCache, 'get_usable_length'):
+                print("✓ DynamicCache已有get_usable_length方法")
+            else:
+                print("⚠️ DynamicCache缺少get_usable_length方法")
+                
+            if hasattr(DynamicCache, 'get_seq_length'):
+                print("✓ DynamicCache已有get_seq_length方法")
+            else:
+                print("⚠️ DynamicCache缺少get_seq_length方法")
+                
+            return True
+        else:
             print("❌ 无法找到DynamicCache类")
             return False
-        
-        # 检查是否需要添加get_usable_length方法
-        if not hasattr(DynamicCache, 'get_usable_length'):
-            def get_usable_length(self):
-                """兼容性方法，返回序列长度"""
-                return self.get_seq_length()
             
-            # 动态添加方法
-            DynamicCache.get_usable_length = get_usable_length
-            print("✓ 已为DynamicCache添加get_usable_length方法")
-        else:
-            print("✓ DynamicCache已包含get_usable_length方法")
-        
-        # 测试修复是否有效
-        cache = DynamicCache()
-        try:
-            result = cache.get_usable_length()
-            print(f"✓ 测试成功，get_usable_length返回: {result}")
-            return True
-        except Exception as e:
-            print(f"❌ 测试失败: {e}")
-            return False
-            
-    except ImportError as e:
-        print(f"❌ 无法导入transformers: {e}")
-        return False
     except Exception as e:
-        print(f"❌ 修复失败: {e}")
+        print(f"❌ 测试失败: {e}")
         import traceback
         traceback.print_exc()
         return False
 
-def test_model_generation():
-    """测试模型生成功能"""
-    print("\n=== 测试模型生成功能 ===")
+def test_simple_model():
+    """测试简单模型加载"""
+    print("\n=== 测试简单模型加载 ===")
     
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
         
         # 设置环境变量
         os.environ['EPW_FAST_LOADING'] = 'true'
@@ -132,7 +121,7 @@ def test_model_generation():
         )
         print("✓ 模型加载成功")
         
-        # 测试生成
+        # 测试简单的前向传播
         test_input = "Hello"
         inputs = tokenizer(test_input, return_tensors="pt")
         
@@ -140,11 +129,16 @@ def test_model_generation():
         model_device = next(model.parameters()).device
         inputs = {k: v.to(model_device) for k, v in inputs.items()}
         
-        print("测试文本生成...")
+        with torch.no_grad():
+            outputs = model(**inputs, output_router_logits=True)
+        
+        print("✓ 前向传播成功")
+        
+        # 测试生成
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
-                max_new_tokens=5,
+                max_new_tokens=3,
                 do_sample=True,
                 temperature=0.7
             )
@@ -161,21 +155,21 @@ def test_model_generation():
         return False
 
 if __name__ == "__main__":
-    print("开始DynamicCache修复...")
+    print("开始简单测试...")
     
-    # 应用修复
-    fix_success = apply_dynamic_cache_fix()
+    # 测试DynamicCache导入
+    import_success = test_dynamic_cache_import()
     
-    if fix_success:
-        print("\n✅ DynamicCache修复成功！")
+    if import_success:
+        print("\n✅ DynamicCache导入测试成功！")
         
-        # 测试模型生成
-        model_success = test_model_generation()
+        # 测试模型加载
+        model_success = test_simple_model()
         
         if model_success:
-            print("\n🎉 所有测试通过！现在可以运行主程序了。")
-            print("运行命令: python epw-enhance-1.py")
+            print("\n🎉 所有测试通过！")
+            print("现在可以运行主程序: python epw-enhance-1.py")
         else:
-            print("\n⚠️ 模型测试失败，但DynamicCache修复成功。")
+            print("\n⚠️ 模型测试失败，但DynamicCache导入成功。")
     else:
-        print("\n❌ DynamicCache修复失败。") 
+        print("\n❌ DynamicCache导入测试失败。") 

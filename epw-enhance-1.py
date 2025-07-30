@@ -30,12 +30,105 @@ from transformers import (
 import warnings
 import time
 
+# 猴子补丁修复DynamicCache问题
+def apply_dynamic_cache_monkey_patch():
+    """应用DynamicCache猴子补丁修复"""
+    try:
+        import transformers
+        
+        # 尝试找到并修补DynamicCache
+        DynamicCache = None
+        
+        # 尝试不同的导入路径
+        for import_path in [
+            'transformers',
+            'transformers.cache',
+            'transformers.utils',
+            'transformers.generation'
+        ]:
+            try:
+                module = __import__(import_path, fromlist=['DynamicCache'])
+                if hasattr(module, 'DynamicCache'):
+                    DynamicCache = module.DynamicCache
+                    print(f"✓ 找到DynamicCache: {import_path}")
+                    break
+            except:
+                continue
+        
+        if DynamicCache is not None:
+            # 添加get_usable_length方法
+            if not hasattr(DynamicCache, 'get_usable_length'):
+                def get_usable_length(self):
+                    """兼容性方法，返回序列长度"""
+                    return self.get_seq_length()
+                
+                DynamicCache.get_usable_length = get_usable_length
+                print("✓ 已为DynamicCache添加get_usable_length方法")
+            else:
+                print("✓ DynamicCache已有get_usable_length方法")
+        else:
+            print("⚠️ 无法找到DynamicCache类")
+            
+    except Exception as e:
+        print(f"⚠️ DynamicCache猴子补丁修复失败: {e}")
+
+# 在导入其他模块之前应用修复
+apply_dynamic_cache_monkey_patch()
+
 # 修复DynamicCache兼容性问题 - 更强大的修复方案
 def fix_dynamic_cache_compatibility():
     """修复DynamicCache兼容性问题"""
     try:
-        # 尝试导入DynamicCache
-        from transformers.cache import DynamicCache
+        # 导入transformers
+        import transformers
+        
+        # 尝试不同的导入路径
+        DynamicCache = None
+        
+        # 方法1: 直接从transformers导入
+        try:
+            from transformers import DynamicCache
+            print("✓ 从transformers直接导入DynamicCache成功")
+        except ImportError:
+            pass
+        
+        # 方法2: 从transformers.cache导入
+        if DynamicCache is None:
+            try:
+                from transformers.cache import DynamicCache
+                print("✓ 从transformers.cache导入DynamicCache成功")
+            except ImportError:
+                pass
+        
+        # 方法3: 从transformers.utils导入
+        if DynamicCache is None:
+            try:
+                from transformers.utils import DynamicCache
+                print("✓ 从transformers.utils导入DynamicCache成功")
+            except ImportError:
+                pass
+        
+        # 方法4: 从transformers.generation导入
+        if DynamicCache is None:
+            try:
+                from transformers.generation import DynamicCache
+                print("✓ 从transformers.generation导入DynamicCache成功")
+            except ImportError:
+                pass
+        
+        # 如果所有方法都失败，尝试动态查找
+        if DynamicCache is None:
+            # 遍历transformers模块查找DynamicCache
+            for attr_name in dir(transformers):
+                attr = getattr(transformers, attr_name)
+                if hasattr(attr, '__name__') and attr.__name__ == 'DynamicCache':
+                    DynamicCache = attr
+                    print("✓ 动态找到DynamicCache")
+                    break
+        
+        if DynamicCache is None:
+            print("⚠️ 无法找到DynamicCache类，跳过兼容性修复")
+            return
         
         # 检查是否需要添加get_usable_length方法
         if not hasattr(DynamicCache, 'get_usable_length'):
@@ -50,7 +143,7 @@ def fix_dynamic_cache_compatibility():
             print("✓ DynamicCache已包含get_usable_length方法")
             
     except ImportError:
-        print("⚠️ 无法导入DynamicCache，跳过兼容性修复")
+        print("⚠️ 无法导入transformers，跳过兼容性修复")
     except Exception as e:
         print(f"⚠️ DynamicCache修复失败: {e}")
 
