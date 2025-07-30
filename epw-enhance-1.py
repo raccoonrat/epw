@@ -23,10 +23,10 @@ import hashlib
 import hmac
 import math
 from typing import List, Optional, Dict, Any, Union
-from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor
-from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM, MixtralSparseMoeBlock
+from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, BitsAndBytesConfig
 from transformers.generation.utils import CausalLMOutputWithPast
 # Import the module itself to allow for monkey-patching the loss function
+# Note: This may need to be adjusted for different MoE architectures
 import transformers.models.mixtral.modeling_mixtral as modeling_mixtral
 import importlib.metadata
 import warnings
@@ -76,21 +76,48 @@ except importlib.metadata.PackageNotFoundError:
 # by overriding key methods of the generation mixin, and adds IRSH protocol support.
 # =======================================================================================
 
-class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
+class MoEForCausalLMWithWatermark(AutoModelForCausalLM):
     """
-    This subclass of MixtralForCausalLM is engineered to reliably pass expert routing
+    This subclass is engineered to reliably pass expert routing
     information to a logits processor during text generation, with enhanced IRSH support.
+    Supports various MoE architectures including Mixtral and DeepSeek MoE.
     """
 
     def __init__(self, config):
         super().__init__(config)
         # Initialize router_hash as None, will be calculated when needed
         self._router_hash = None
+        self._num_experts = self._get_num_experts()
+        
+    def _get_num_experts(self) -> int:
+        """
+        Dynamically determine the number of experts based on model architecture.
+        """
+        try:
+            # Try to get expert count from config
+            if hasattr(self.config, 'num_experts'):
+                return self.config.num_experts
+            elif hasattr(self.config, 'num_local_experts'):
+                return self.config.num_local_experts
+            elif hasattr(self.config, 'moe_config') and hasattr(self.config.moe_config, 'num_experts'):
+                return self.config.moe_config.num_experts
+            else:
+                # Default to 8 for Mixtral, 16 for DeepSeek MoE
+                if 'deepseek' in self.config.model_type.lower():
+                    return 16
+                elif 'mixtral' in self.config.model_type.lower():
+                    return 8
+                else:
+                    return 8  # Default fallback
+        except Exception as e:
+            print(f"Warning: Could not determine expert count: {e}")
+            return 8  # Default fallback
         
     def _calculate_router_hash(self) -> str:
         """
         Calculate the cryptographic hash of router weights for IRSH protocol.
         This binds the watermark to a specific version of the router.
+        Supports various MoE architectures.
         """
         # If already calculated, return cached value
         if self._router_hash is not None:
@@ -101,9 +128,18 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
         try:
             # Collect router weights from all MoE layers
             for layer in self.model.layers:
-                if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
+                # Support different MoE architectures
+                moe_block = None
+                if hasattr(layer, 'block_sparse_moe'):
+                    moe_block = layer.block_sparse_moe
+                elif hasattr(layer, 'mlp'):
+                    # Some models have MoE in mlp
+                    if hasattr(layer.mlp, 'gate'):
+                        moe_block = layer.mlp
+                
+                if moe_block and hasattr(moe_block, 'gate'):
                     # Get the gate weights (router weights)
-                    gate_weights = layer.block_sparse_moe.gate.weight.data
+                    gate_weights = moe_block.gate.weight.data
                     
                     # Check if the tensor is a meta tensor (no data)
                     if hasattr(gate_weights, 'is_meta') and gate_weights.is_meta:
@@ -159,7 +195,7 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
         inference and can cause errors.
         """
         # Only set output_router_logits for MoE models
-        if hasattr(self.config, 'model_type') and 'mixtral' in self.config.model_type.lower():
+        if hasattr(self.config, 'model_type') and any(moe_type in self.config.model_type.lower() for moe_type in ['mixtral', 'deepseek', 'moe']):
             kwargs['output_router_logits'] = True
 
         # MONKEY-PATCH to bypass problematic auxiliary loss calculation during inference.
@@ -374,12 +410,14 @@ class WatermarkLogitsProcessor(LogitsProcessor):
             
             # 基于token ID和位置计算专家索引
             position = input_ids.shape[1] - 1
-            expert_index = (last_token_id + position) % 8
+            # 动态获取专家数量，默认为16（DeepSeek MoE）
+            num_experts = 16  # 默认值，实际应该从模型配置获取
+            expert_index = (last_token_id + position) % num_experts
             
             # 添加一些随机性以提高质量
             if position > 0:
                 prev_token_id = input_ids[0, -2].item()
-                expert_index = (expert_index + prev_token_id) % 8
+                expert_index = (expert_index + prev_token_id) % num_experts
         else:
             expert_index = 0
         
@@ -445,8 +483,15 @@ class WatermarkDetector:
 
         handles = []
         for layer in self.model.model.layers:
-            if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
-                handle = layer.block_sparse_moe.gate.register_forward_hook(detection_hook_fn)
+            # Support different MoE architectures
+            moe_block = None
+            if hasattr(layer, 'block_sparse_moe'):
+                moe_block = layer.block_sparse_moe
+            elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+                moe_block = layer.mlp
+            
+            if moe_block and hasattr(moe_block, 'gate'):
+                handle = moe_block.gate.register_forward_hook(detection_hook_fn)
                 handles.append(handle)
 
         if not handles: return {"error": "Could not find any MoE layers to attach hooks to."}
@@ -560,8 +605,15 @@ class EPWADetectionSuite:
 
         handles = []
         for layer in self.model.model.layers:
-            if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
-                handle = layer.block_sparse_moe.gate.register_forward_hook(confidence_hook_fn)
+            # Support different MoE architectures
+            moe_block = None
+            if hasattr(layer, 'block_sparse_moe'):
+                moe_block = layer.block_sparse_moe
+            elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+                moe_block = layer.mlp
+            
+            if moe_block and hasattr(moe_block, 'gate'):
+                handle = moe_block.gate.register_forward_hook(confidence_hook_fn)
                 handles.append(handle)
 
         if not handles:
@@ -659,8 +711,15 @@ class EPWADetectionSuite:
 
             handles = []
             for layer in self.model.model.layers:
-                if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
-                    handle = layer.block_sparse_moe.gate.register_forward_hook(oracle_training_hook_fn)
+                # Support different MoE architectures
+                moe_block = None
+                if hasattr(layer, 'block_sparse_moe'):
+                    moe_block = layer.block_sparse_moe
+                elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+                    moe_block = layer.mlp
+                
+                if moe_block and hasattr(moe_block, 'gate'):
+                    handle = moe_block.gate.register_forward_hook(oracle_training_hook_fn)
                     handles.append(handle)
 
             try:
@@ -688,7 +747,9 @@ class EPWADetectionSuite:
                     Y_experts.append(expert_sequence[t])
 
         # Create and train the oracle
-        oracle = PathInferenceOracle(self.vocab_size, num_experts=8)  # Assuming 8 experts for Mixtral
+        # Get expert count from model or use default
+        num_experts = getattr(self.model, '_num_experts', 16)  # Default to 16 for DeepSeek MoE
+        oracle = PathInferenceOracle(self.vocab_size, num_experts=num_experts)
         oracle.train(X_logits, Y_experts)
         
         print(f"Oracle training completed with {len(X_logits)} samples")
@@ -765,7 +826,7 @@ class PathInferenceOracle:
     Used for black-box detection in the PEPI framework.
     """
     
-    def __init__(self, vocab_size: int, num_experts: int = 8):
+    def __init__(self, vocab_size: int, num_experts: int = 16):  # 默认改为16以支持DeepSeek MoE
         self.vocab_size = vocab_size
         self.num_experts = num_experts
         self.classifier = None
@@ -885,6 +946,7 @@ if __name__ == '__main__':
     # 如果没有设置环境变量，尝试一些常见的模型路径
     if model_name is None:
         possible_paths = [
+            "deepseek-ai/deepseek-moe-16b-chat",  # 默认使用DeepSeek MoE
             "/root/private_data/model/mixtral-8x7b",
             "microsoft/DialoGPT-medium",  # 备用模型，用于测试
             "gpt2",  # 另一个备用模型
@@ -892,13 +954,13 @@ if __name__ == '__main__':
         
         # 检查路径是否存在
         for path in possible_paths:
-            if os.path.exists(path) or path.startswith(('microsoft/', 'gpt2')):
+            if os.path.exists(path) or path.startswith(('deepseek-ai/', 'microsoft/', 'gpt2')):
                 model_name = path
                 break
         
         if model_name is None:
-            print("Warning: No valid model path found. Using 'microsoft/DialoGPT-medium' as fallback.")
-            model_name = "microsoft/DialoGPT-medium"
+            print("Warning: No valid model path found. Using 'deepseek-ai/deepseek-moe-16b-chat' as fallback.")
+            model_name = "deepseek-ai/deepseek-moe-16b-chat"
     
     print(f"Using model: {model_name}")
 
@@ -948,7 +1010,7 @@ if __name__ == '__main__':
                 quantization_config = None
         elif FAST_LOADING:
             # 快速加载模式下的默认量化策略
-            if bitsandbytes_installed and "mixtral" in model_name.lower():
+            if bitsandbytes_installed and any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
                 print("快速加载模式：使用4位量化...")
                 try:
                     quantization_config = BitsAndBytesConfig(
@@ -962,7 +1024,7 @@ if __name__ == '__main__':
                     quantization_config = None
         else:
             # 标准加载模式
-            if bitsandbytes_installed and "mixtral" in model_name.lower():
+            if bitsandbytes_installed and any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
                 print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
                 try:
                     quantization_config = BitsAndBytesConfig(
@@ -980,10 +1042,10 @@ if __name__ == '__main__':
         model_start = time.time()
         
         try:
-            # 尝试使用自定义的Mixtral模型类
-            if "mixtral" in model_name.lower():
-                print("Loading Mixtral model with watermark support...")
-                model = MixtralForCausalLMWithWatermark.from_pretrained(
+            # 尝试使用自定义的MoE模型类
+            if any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
+                print("Loading MoE model with watermark support...")
+                model = MoEForCausalLMWithWatermark.from_pretrained(
                     model_name,
                     quantization_config=quantization_config,
                     device_map=device_map,
@@ -1110,8 +1172,9 @@ if __name__ == '__main__':
         # Example 2: EWP mode (Expert-Specific Weighted Perturbation)
         print("\n--- EWP Mode ---")
         # Create expert-specific delta configuration
-        # Assuming 8 experts (typical for Mixtral), assign different base deltas
-        expert_deltas = {i: 3.0 + i * 0.5 for i in range(8)}  # Deltas from 3.0 to 6.5
+        # Get expert count from model
+        num_experts = getattr(model, '_num_experts', 16)  # Default to 16 for DeepSeek MoE
+        expert_deltas = {i: 3.0 + i * 0.5 for i in range(num_experts)}  # Deltas from 3.0 to 3.0 + (num_experts-1) * 0.5
         
         ewp_processor = EPWALogitsProcessor(
             vocab_size=model.config.vocab_size,
