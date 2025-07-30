@@ -239,6 +239,7 @@ class EPWALogitsProcessor(LogitsProcessor):
         self.mode = mode
         self.delta_config = delta_config
         self.green_list_size = int(self.vocab_size * self.gamma)
+        self._fallback_printed = False  # 初始化fallback打印标志
         
         # Validate configuration
         if mode == "ewp" and not isinstance(delta_config, dict):
