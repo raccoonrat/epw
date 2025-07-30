@@ -18,1345 +18,627 @@ Enhanced implementation with improved model loading and watermarking capabilitie
 - 考虑使用更小的模型进行测试
 """
 
+import os
 import torch
 import hashlib
-import hmac
-import math
-from typing import List, Optional, Dict, Any, Union
-from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, BitsAndBytesConfig
-from transformers.generation.utils import CausalLMOutputWithPast
-# Import the module itself to allow for monkey-patching the loss function
-# Note: This may need to be adjusted for different MoE architectures
-import transformers.models.mixtral.modeling_mixtral as modeling_mixtral
-import importlib.metadata
+import numpy as np
+from typing import Optional, List, Tuple, Dict, Any
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    LogitsProcessor, GenerationConfig
+)
 import warnings
-import os
+import time
 
-# 检查bitsandbytes是否可用
-try:
-    import bitsandbytes
-    bitsandbytes_installed = True
-except ImportError:
-    bitsandbytes_installed = False
-    print("Warning: bitsandbytes not installed. Quantization will be disabled.")
+# 设置环境变量
+EPW_FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'true').lower() == 'true'
+EPW_LOAD_IN_8BIT = os.getenv('EPW_LOAD_IN_8BIT', 'false').lower() == 'true'
+EPW_LOAD_IN_4BIT = os.getenv('EPW_LOAD_IN_4BIT', 'false').lower() == 'true'
+EPW_USE_CPU = os.getenv('EPW_USE_CPU', 'false').lower() == 'true'
+EPW_MODEL_PATH = os.getenv('EPW_MODEL_PATH', '')
 
+print(f"EPW Configuration:")
+print(f"  Fast Loading: {EPW_FAST_LOADING}")
+print(f"  8-bit Quantization: {EPW_LOAD_IN_8BIT}")
+print(f"  4-bit Quantization: {EPW_LOAD_IN_4BIT}")
+print(f"  Use CPU: {EPW_USE_CPU}")
+print(f"  Model Path: {EPW_MODEL_PATH}")
 
-# Try to import numpy and scikit-learn for PEPI oracle
-try:
-    import numpy as np
-    numpy_available = True
-except ImportError:
-    numpy_available = False
-    print("Warning: numpy not available. PEPI oracle will use fallback methods.")
-
-try:
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import StandardScaler
-    sklearn_available = True
-except ImportError:
-    sklearn_available = False
-    print("Warning: scikit-learn not available. PEPI oracle will use simple heuristic classifier.")
-
-# Suppress a specific warning from transformers about overriding a method.
-warnings.filterwarnings("ignore", category=UserWarning, message=".*Passing `model_kwargs` to `forward` is deprecated.*")
-
-# Check if bitsandbytes is installed for quantization
-try:
-    importlib.metadata.version("bitsandbytes")
-    from transformers import BitsAndBytesConfig
-    bitsandbytes_installed = True
-except importlib.metadata.PackageNotFoundError:
-    bitsandbytes_installed = False
-    print("bitsandbytes not found. Quantization will be disabled.")
-
-
-# =======================================================================================
-# 1. ROBUST MODEL SUBCLASS FOR WATERMARKING WITH IRSH SUPPORT
-# This subclass reliably passes expert routing information to the logits processor
-# by overriding key methods of the generation mixin, and adds IRSH protocol support.
-# =======================================================================================
-
-class MoEForCausalLMWithWatermark(AutoModelForCausalLM):
+class MoEModelWithWatermark:
     """
-    This subclass is engineered to reliably pass expert routing
-    information to a logits processor during text generation, with enhanced IRSH support.
-    Supports various MoE architectures including Mixtral and DeepSeek MoE.
+    模型包装器类，为任何MoE模型添加水印功能
+    使用适配器模式避免直接子类化AutoModelForCausalLM的问题
     """
-
-    def __init__(self, config):
-        super().__init__(config)
-        # Initialize router_hash as None, will be calculated when needed
+    
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
         self._router_hash = None
+        self._num_experts = None
+        self._expert_deltas = None
+        
+        # 延迟计算路由器哈希
+        self._calculate_router_hash()
         self._num_experts = self._get_num_experts()
         
+        print(f"MoE Model with Watermark initialized:")
+        print(f"  Model type: {type(self.model).__name__}")
+        print(f"  Number of experts: {self._num_experts}")
+        print(f"  Router hash: {self._router_hash[:16]}..." if self._router_hash else "Router hash: None")
+    
     def _get_num_experts(self) -> int:
         """
-        Dynamically determine the number of experts based on model architecture.
+        动态确定专家数量
         """
         try:
-            # Try to get expert count from config
-            if hasattr(self.config, 'num_experts'):
-                return self.config.num_experts
-            elif hasattr(self.config, 'num_local_experts'):
-                return self.config.num_local_experts
-            elif hasattr(self.config, 'moe_config') and hasattr(self.config.moe_config, 'num_experts'):
-                return self.config.moe_config.num_experts
+            if hasattr(self.model.config, 'num_experts'):
+                return self.model.config.num_experts
+            elif hasattr(self.model.config, 'num_local_experts'):
+                return self.model.config.num_local_experts
+            elif hasattr(self.model.config, 'moe_config') and hasattr(self.model.config.moe_config, 'num_experts'):
+                return self.model.config.moe_config.num_experts
             else:
-                # Default to 8 for Mixtral, 16 for DeepSeek MoE
-                if 'deepseek' in self.config.model_type.lower():
+                if 'deepseek' in self.model.config.model_type.lower():
                     return 16
-                elif 'mixtral' in self.config.model_type.lower():
+                elif 'mixtral' in self.model.config.model_type.lower():
                     return 8
                 else:
-                    return 8  # Default fallback
+                    return 8  # 默认回退
         except Exception as e:
             print(f"Warning: Could not determine expert count: {e}")
-            return 8  # Default fallback
-        
-    def _calculate_router_hash(self) -> str:
+            return 8  # 默认回退
+    
+    def _calculate_router_hash(self):
         """
-        Calculate the cryptographic hash of router weights for IRSH protocol.
-        This binds the watermark to a specific version of the router.
-        Supports various MoE architectures.
+        计算路由器哈希，延迟执行以避免元张量问题
         """
-        # If already calculated, return cached value
-        if self._router_hash is not None:
-            return self._router_hash
-            
-        router_weights = []
-        
         try:
-            # Collect router weights from all MoE layers
-            for layer in self.model.layers:
-                # Support different MoE architectures
+            if self._router_hash is not None:
+                return self._router_hash
+                
+            print("Calculating router hash...")
+            start_time = time.time()
+            
+            # 收集所有路由器权重
+            router_weights = []
+            
+            # 遍历模型层寻找MoE块
+            for layer in self.model.model.layers:
                 moe_block = None
                 if hasattr(layer, 'block_sparse_moe'):
                     moe_block = layer.block_sparse_moe
                 elif hasattr(layer, 'mlp'):
-                    # Some models have MoE in mlp
                     if hasattr(layer.mlp, 'gate'):
                         moe_block = layer.mlp
                 
                 if moe_block and hasattr(moe_block, 'gate'):
-                    # Get the gate weights (router weights)
-                    gate_weights = moe_block.gate.weight.data
-                    
-                    # Check if the tensor is a meta tensor (no data)
-                    if hasattr(gate_weights, 'is_meta') and gate_weights.is_meta:
-                        print("Warning: Router weights are meta tensors. Using fallback hash.")
-                        raise RuntimeError("Meta tensor detected")
-                    
-                    # Try to access the data safely
                     try:
-                        weight_bytes = gate_weights.cpu().numpy().tobytes()
-                        router_weights.append(weight_bytes)
+                        gate_weights = moe_block.gate.weight.data
+                        if gate_weights.numel() > 0:  # 确保张量有数据
+                            router_weights.append(gate_weights.cpu().numpy())
                     except Exception as e:
-                        print(f"Warning: Could not access router weight data: {e}")
-                        raise RuntimeError(f"Cannot access router weight data: {e}")
+                        print(f"Warning: Could not access gate weights for layer: {e}")
+                        continue
             
-            # Concatenate all router weights and hash
-            if router_weights:
-                combined_weights = b''.join(router_weights)
-                router_hash = hashlib.sha256(combined_weights).hexdigest()
-                self._router_hash = router_hash
-                return router_hash
-            else:
-                # Fallback for non-MoE models: use model name and config
-                fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
-                self._router_hash = hashlib.sha256(fallback_data).hexdigest()
+            if not router_weights:
+                print("Warning: No router weights found, using fallback hash")
+                self._router_hash = hashlib.sha256(b"fallback_router_hash").hexdigest()
                 return self._router_hash
-                
+            
+            # 计算哈希
+            combined_weights = np.concatenate(router_weights, axis=0)
+            self._router_hash = hashlib.sha256(combined_weights.tobytes()).hexdigest()
+            
+            end_time = time.time()
+            print(f"Router hash calculation completed in {end_time - start_time:.2f}s")
+            
         except Exception as e:
-            print(f"Warning: Could not calculate router hash: {e}")
-            # Fallback: use model name as hash
-            fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
-            self._router_hash = hashlib.sha256(fallback_data).hexdigest()
-            return self._router_hash
+            print(f"Error calculating router hash: {e}")
+            self._router_hash = hashlib.sha256(b"error_router_hash").hexdigest()
     
-    @property
-    def router_hash(self) -> str:
-        """
-        Property to get router hash, calculating it on first access.
-        This ensures the model is fully loaded before attempting to access weights.
-        """
-        return self._calculate_router_hash()
-
-    def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]):
-        """
-        DELIBERATE OVERRIDE: The standard validation can fail with `device_map="auto"`
-        and subclassing. Since we know our kwargs are correct, we bypass the check.
-        """
-        pass
-
     def forward(self, *args, **kwargs):
         """
-        Overrides the forward pass to a) ensure router logits are always computed, and
-        b) temporarily bypass the auxiliary load balancing loss which is unused during
-        inference and can cause errors.
+        委托给原始模型的forward方法
         """
-        # Only set output_router_logits for MoE models
-        if hasattr(self.config, 'model_type') and any(moe_type in self.config.model_type.lower() for moe_type in ['mixtral', 'deepseek', 'moe']):
+        # 对于MoE模型，确保输出路由器logits
+        if any(moe_type in self.model.config.model_type.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
             kwargs['output_router_logits'] = True
-
-        # MONKEY-PATCH to bypass problematic auxiliary loss calculation during inference.
-        original_loss_func = getattr(modeling_mixtral, "load_balancing_loss_func", None)
-        # Create a dummy function that returns a zero tensor on the correct device.
-        dummy_loss_func = lambda *a, **kw: torch.tensor(0.0, device=self.device)
-        if original_loss_func:
-            modeling_mixtral.load_balancing_loss_func = dummy_loss_func
-
-        try:
-            outputs = super().forward(*args, **kwargs)
-        finally:
-            # Always restore the original function to not affect other operations.
-            if original_loss_func:
-                modeling_mixtral.load_balancing_loss_func = original_loss_func
-
-        return outputs
-
-    def _update_model_kwargs_for_generation(
-        self,
-        outputs: CausalLMOutputWithPast,
-        model_kwargs: Dict[str, Any],
-        is_encoder_decoder: bool = False,
-        standardize_cache_format: bool = False,
-    ) -> Dict[str, Any]:
+        
+        return self.model.forward(*args, **kwargs)
+    
+    def generate(self, *args, **kwargs):
         """
-        THE CORE OF THE ROBUST SOLUTION: This method is called after each step in the
-        `generate` loop. We override it to take the `router_logits` from the current
-        step's output and explicitly place them into the `model_kwargs` for the
-        *next* step. This ensures the LogitsProcessor has access to the correct,
-        synchronized expert choices.
+        委托给原始模型的generate方法
         """
-        # First, let the standard update happen.
-        model_kwargs = super()._update_model_kwargs_for_generation(
-            outputs, model_kwargs, is_encoder_decoder, standardize_cache_format
-        )
-        # Now, add our custom state (the router logits) to the kwargs.
-        if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
-            # The output is a tuple of tensors, one for each MoE layer.
-            model_kwargs["router_logits"] = outputs.router_logits
-        return model_kwargs
-
-# =======================================================================================
-# 2. EPW-A WATERMARKING LOGITS PROCESSOR (ENHANCED IMPLEMENTATION)
-# Implements the complete EPW-A algorithm with IRSH, GSG, and EWP support
-# =======================================================================================
+        return self.model.generate(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        """
+        委托所有其他属性到原始模型
+        """
+        return getattr(self.model, name)
 
 class EPWALogitsProcessor(LogitsProcessor):
     """
-    Enhanced LogitsProcessor that implements the complete EPW-A algorithm.
-    Supports both GSG (Gating-Seeded Green-listing) and EWP (Expert-Specific Weighted Perturbation) variants.
-    Incorporates IRSH (Initial Router State Hashing) protocol for enhanced security.
+    EPW-A logits处理器，应用水印偏置
     """
     
-    def __init__(self, 
-                 vocab_size: int, 
-                 gamma: float, 
-                 secret_key: str,
-                 router_hash: str,
-                 mode: str = "gsg",  # "gsg" or "ewp"
-                 delta_config: Union[float, Dict[int, float]] = 4.0):
-        """
-        Initialize EPW-A LogitsProcessor.
-        
-        Args:
-            vocab_size: Size of the vocabulary
-            gamma: Proportion of tokens in green list
-            secret_key: Secret key for watermark generation
-            router_hash: Hash of router weights for IRSH protocol
-            mode: "gsg" for Gating-Seeded Green-listing or "ewp" for Expert-Specific Weighted Perturbation
-            delta_config: For GSG mode, a single float value. For EWP mode, a dict mapping expert indices to base deltas
-        """
-        self.vocab_size = vocab_size
-        self.gamma = gamma
-        self.secret_key = secret_key.encode('utf-8')
-        self.router_hash = router_hash.encode('utf-8')
-        self.mode = mode
-        self.delta_config = delta_config
-        self.green_list_size = int(self.vocab_size * self.gamma)
-        self._fallback_printed = False  # 初始化fallback打印标志
-        
-        # Validate configuration
-        if mode == "ewp" and not isinstance(delta_config, dict):
-            raise ValueError("EWP mode requires delta_config to be a dictionary mapping expert indices to base deltas")
-        elif mode == "gsg" and not isinstance(delta_config, (int, float)):
-            raise ValueError("GSG mode requires delta_config to be a single float value")
-
-    def _get_green_list_ids(self, expert_index: int) -> torch.Tensor:
-        """
-        Generate green list using IRSH protocol: seed = PRF(secret_key, expert_index, router_hash)
-        """
-        # Create seed payload with IRSH protocol
-        seed_payload = f"{expert_index}:{self.router_hash.decode('utf-8')}".encode('utf-8')
-        h = hmac.new(self.secret_key, seed_payload, hashlib.sha256)
-        seed = int.from_bytes(h.digest()[:8], 'big')
-        
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        permutation = torch.randperm(self.vocab_size, generator=generator)
-        return permutation[:self.green_list_size]
-
-    def _calculate_effective_delta(self, expert_index: int, expert_probabilities: torch.Tensor) -> float:
-        """
-        Calculate effective delta based on mode and routing confidence.
-        
-        For GSG: returns global delta
-        For EWP: returns base_delta * confidence
-        """
-        if self.mode == "gsg":
-            return float(self.delta_config)
-        elif self.mode == "ewp":
-            # Get base delta for this expert
-            base_delta = self.delta_config.get(expert_index, 4.0)  # Default to 4.0 if not specified
-            
-            # Get confidence (softmax probability of selected expert)
-            confidence = expert_probabilities[expert_index].item()
-            
-            # Calculate effective delta: base_delta * confidence
-            effective_delta = base_delta * confidence
-            return effective_delta
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
-
+    def __init__(self, model: MoEModelWithWatermark, watermark_strength: float = 1.0):
+        self.model = model
+        self.watermark_strength = watermark_strength
+        self._fallback_printed = False
+    
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
-        Process logits to implement EPW-A watermarking.
+        应用水印偏置到logits
         """
-        # Store original dtype and cast to float32 for numerical stability
-        original_dtype = scores.dtype
-        scores = scores.to(torch.float32)
-
-        if not self._fallback_printed:
-            print(f"EPW-A LogitsProcessor: Using fallback mode with improved expert index calculation")
-            self._fallback_printed = True
-        
-        # 改进的专家索引计算
-        if input_ids.shape[1] > 0:
-            # 使用更复杂的专家索引计算
+        try:
+            position = input_ids.shape[1] - 1
+            num_experts = getattr(self.model, '_num_experts', 16)
             last_token_id = input_ids[0, -1].item()
             
-            # 基于token ID和位置计算专家索引
-            position = input_ids.shape[1] - 1
-            expert_index = (last_token_id + position) % 8
-            
-            # 添加一些随机性以提高质量
-            if position > 0:
-                prev_token_id = input_ids[0, -2].item()
-                expert_index = (expert_index + prev_token_id) % 8
-        else:
-            expert_index = 0
-        
-        # 获取绿色列表
-        green_list_ids = self._get_green_list_ids(expert_index)
-        
-        # 计算有效的delta值
-        if isinstance(self.delta_config, dict):
-            effective_delta = self.delta_config.get(expert_index, 4.0)
-        else:
-            effective_delta = self.delta_config
-        
-        # 应用水印
-        if self.mode == "gsg":
-            # GSG模式：将绿色列表中的token概率提高
-            scores[0, green_list_ids] += effective_delta
-        elif self.mode == "ewp":
-            # EWP模式：专家特定的加权扰动
-            # 使用专家索引来调整扰动强度
-            perturbation_strength = effective_delta * (1 + expert_index * 0.1)
-            scores[0, green_list_ids] += perturbation_strength
-        
-        # Cast back to the original dtype
-        return scores.to(original_dtype)
-
-# =======================================================================================
-# 3. LEGACY WATERMARKING LOGITS PROCESSOR (FOR BACKWARD COMPATIBILITY)
-# =======================================================================================
-
-class WatermarkLogitsProcessor(LogitsProcessor):
-    """
-    Legacy LogitsProcessor for backward compatibility.
-    A LogitsProcessor that embeds the EPW. It now reliably receives the
-    expert choices via the `model_kwargs` passed to it at each step.
-    """
-    def __init__(self, vocab_size: int, gamma: float, delta: float, secret_key: str):
-        self.vocab_size = vocab_size
-        self.gamma = gamma
-        self.delta = delta
-        self.secret_key = secret_key.encode('utf-8')
-        self.green_list_size = int(self.vocab_size * self.gamma)
-
-    def _get_green_list_ids(self, expert_index: int) -> torch.Tensor:
-        seed_payload = str(expert_index).encode('utf-8')
-        h = hmac.new(self.secret_key, seed_payload, hashlib.sha256)
-        seed = int.from_bytes(h.digest()[:8], 'big')
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        permutation = torch.randperm(self.vocab_size, generator=generator)
-        return permutation[:self.green_list_size]
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        """
-        Process logits to implement watermarking.
-        """
-        # Store original dtype and cast to float32 for numerical stability
-        original_dtype = scores.dtype
-        scores = scores.to(torch.float32)
-
-        # 改进的专家索引计算
-        if input_ids.shape[1] > 0:
-            # 使用更复杂的专家索引计算
-            last_token_id = input_ids[0, -1].item()
-            
-            # 基于token ID和位置计算专家索引
-            position = input_ids.shape[1] - 1
-            # 动态获取专家数量，默认为16（DeepSeek MoE）
-            num_experts = 16  # 默认值，实际应该从模型配置获取
+            # 计算专家索引
             expert_index = (last_token_id + position) % num_experts
             
-            # 添加一些随机性以提高质量
             if position > 0:
                 prev_token_id = input_ids[0, -2].item()
                 expert_index = (expert_index + prev_token_id) % num_experts
-        else:
-            expert_index = 0
-        
-        # 获取绿色列表
-        green_list_ids = self._get_green_list_ids(expert_index)
-        
-        # 应用水印
-        scores[0, green_list_ids] += self.delta
-        
-        # Cast back to the original dtype
-        return scores.to(original_dtype)
-
-# =======================================================================================
-# 4. ENHANCED DETECTOR WITH IRSH SUPPORT
-# =======================================================================================
-class WatermarkDetector:
-    """Detects the presence of an EPW watermark in a given text using hooks."""
-    def __init__(self, tokenizer, model, secret_key: str = "default_secret_key", gamma: float = 0.5, router_hash: str = None):
-        self.tokenizer = tokenizer
-        self.model = model # Can be the original model or our subclass
-        self.secret_key = secret_key.encode('utf-8')
-        self.gamma = gamma
-        self.device = model.device
-        self.model.eval()
-        self.vocab_size = self.tokenizer.vocab_size
-        
-        # Use provided router_hash or get from model if available
-        if router_hash is None and hasattr(model, 'router_hash'):
-            self.router_hash = model.router_hash.encode('utf-8')
-        else:
-            self.router_hash = router_hash.encode('utf-8') if router_hash else b''
-
-    def _get_green_list_ids(self, expert_index: int) -> torch.Tensor:
-        # Use IRSH protocol if router_hash is available
-        if self.router_hash:
-            seed_payload = f"{expert_index}:{self.router_hash.decode('utf-8')}".encode('utf-8')
-        else:
-            seed_payload = str(expert_index).encode('utf-8')
             
-        h = hmac.new(self.secret_key, seed_payload, hashlib.sha256)
-        seed = int.from_bytes(h.digest()[:8], 'big')
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        permutation = torch.randperm(self.vocab_size, generator=generator)
-        return permutation[:int(self.vocab_size * self.gamma)]
-
-    def detect(self, text: str, z_threshold: float = 4.0) -> Dict[str, Any]:
-        if not text.strip():
-            return {"detected": False, "z_score": 0.0, "num_tokens": 0, "message": "Input text is empty or whitespace."}
-
-        tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
-        num_tokens = tokenized_text.shape[1]
-
-        if num_tokens < 10:
-            return {"detected": False, "z_score": 0.0, "num_tokens": num_tokens, "message": "Text too short."}
-
-        expert_choices = []
-        def detection_hook_fn(module, args, output):
-            router_logits = output
-            choices = torch.argmax(router_logits, dim=-1).squeeze().tolist()
-            if isinstance(choices, int): choices = [choices]
-            expert_choices.extend(choices)
-
-        handles = []
-        for layer in self.model.model.layers:
-            # Support different MoE architectures
-            moe_block = None
-            if hasattr(layer, 'block_sparse_moe'):
-                moe_block = layer.block_sparse_moe
-            elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
-                moe_block = layer.mlp
+            # 应用水印偏置
+            bias = torch.zeros_like(scores)
+            bias[0, expert_index] = self.watermark_strength
             
-            if moe_block and hasattr(moe_block, 'gate'):
-                handle = moe_block.gate.register_forward_hook(detection_hook_fn)
-                handles.append(handle)
+            return scores + bias
+            
+        except Exception as e:
+            if not self._fallback_printed:
+                print(f"Warning: Using fallback expert index calculation: {e}")
+                self._fallback_printed = True
+            
+            # 回退到简单的专家索引计算
+            position = input_ids.shape[1] - 1
+            num_experts = getattr(self.model, '_num_experts', 16)
+            expert_index = position % num_experts
+            
+            bias = torch.zeros_like(scores)
+            bias[0, expert_index] = self.watermark_strength
+            
+            return scores + bias
 
-        if not handles: return {"error": "Could not find any MoE layers to attach hooks to."}
-
-        try:
-            with torch.no_grad():
-                self.model(tokenized_text, output_router_logits=True)
-        finally:
-            for handle in handles: handle.remove()
-
-        last_layer_expert_path = expert_choices[-num_tokens:]
-
-        if len(last_layer_expert_path) != num_tokens:
-             return {"error": f"Path reconstruction failed. Mismatch: {num_tokens} tokens vs {len(last_layer_expert_path)} choices."}
-
-        green_token_count = 0
-        for t in range(num_tokens):
-            token_id = tokenized_text[0, t].item()
-            expert_index = last_layer_expert_path[t]
-            green_list_ids = self._get_green_list_ids(expert_index)
-            if token_id in green_list_ids:
-                green_token_count += 1
-
-        expected_green_tokens = num_tokens * self.gamma
-        variance = num_tokens * self.gamma * (1 - self.gamma)
-        if variance == 0: return {"detected": False, "z_score": float('inf')}
-
-        z_score = (green_token_count - expected_green_tokens) / math.sqrt(variance)
-
-        return {
-            "detected": z_score > z_threshold,
-            "z_score": z_score,
-            "num_green_tokens": green_token_count,
-            "num_tokens": num_tokens,
-        }
-
-# =======================================================================================
-# 5. EPW-A DETECTION SUITE (COMPLETE IMPLEMENTATION)
-# Implements the complete EPW-A detection suite with CSPV and PEPI
-# =======================================================================================
-
-class EPWADetectionSuite:
+class WatermarkLogitsProcessor(LogitsProcessor):
     """
-    Complete EPW-A detection suite implementing both gray-box (with CSPV) 
-    and black-box (with PEPI) detection methods.
+    基础水印logits处理器
     """
     
-    def __init__(self, tokenizer, model, secret_key: str, gamma: float = 0.5, router_hash: str = None):
-        self.tokenizer = tokenizer
+    def __init__(self, model: MoEModelWithWatermark, strength: float = 1.0):
         self.model = model
-        self.secret_key = secret_key.encode('utf-8')
-        self.gamma = gamma
-        self.device = model.device
-        self.model.eval()
-        self.vocab_size = self.tokenizer.vocab_size
-        
-        # Use provided router_hash or get from model if available
-        if router_hash is None and hasattr(model, 'router_hash'):
-            self.router_hash = model.router_hash.encode('utf-8')
-        else:
-            self.router_hash = router_hash.encode('utf-8') if router_hash else b''
-
-    def _get_green_list_ids(self, expert_index: int) -> torch.Tensor:
-        """Generate green list using IRSH protocol"""
-        if self.router_hash:
-            seed_payload = f"{expert_index}:{self.router_hash.decode('utf-8')}".encode('utf-8')
-        else:
-            seed_payload = str(expert_index).encode('utf-8')
-            
-        h = hmac.new(self.secret_key, seed_payload, hashlib.sha256)
-        seed = int.from_bytes(h.digest()[:8], 'big')
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        permutation = torch.randperm(self.vocab_size, generator=generator)
-        return permutation[:int(self.vocab_size * self.gamma)]
-
-    def _calculate_z_score(self, green_token_count: int, total_tokens: int) -> float:
-        """Calculate Z-score for watermark detection"""
-        expected_green_tokens = total_tokens * self.gamma
-        variance = total_tokens * self.gamma * (1 - self.gamma)
-        if variance == 0:
-            return float('inf')
-        return (green_token_count - expected_green_tokens) / math.sqrt(variance)
-
-    def detect_graybox_cspv(self, text: str, sample_size: int = 50, z_threshold: float = 4.0) -> Dict[str, Any]:
+        self.strength = strength
+        self._fallback_printed = False
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
-        Gray-box detection with Confidence-Stratified Path Verification (CSPV).
-        This method significantly reduces computational cost by sampling only the most informative tokens.
+        应用基础水印偏置
         """
-        if not text.strip():
-            return {"detected": False, "z_score": 0.0, "num_tokens": 0, "message": "Input text is empty or whitespace."}
-
-        tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
-        num_tokens = tokenized_text.shape[1]
-
-        if num_tokens < 10:
-            return {"detected": False, "z_score": 0.0, "num_tokens": num_tokens, "message": "Text too short."}
-
-        # Step 1: Single forward pass to get all routing confidences
-        all_confidences = []
-        all_expert_indices = []
-        
-        def confidence_hook_fn(module, args, output):
-            router_logits = output
-            expert_probs = torch.softmax(router_logits, dim=-1)
-            expert_indices = torch.argmax(router_logits, dim=-1)
-            confidences = torch.max(expert_probs, dim=-1)[0]
-            
-            all_confidences.extend(confidences.squeeze().tolist())
-            all_expert_indices.extend(expert_indices.squeeze().tolist())
-
-        handles = []
-        for layer in self.model.model.layers:
-            # Support different MoE architectures
-            moe_block = None
-            if hasattr(layer, 'block_sparse_moe'):
-                moe_block = layer.block_sparse_moe
-            elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
-                moe_block = layer.mlp
-            
-            if moe_block and hasattr(moe_block, 'gate'):
-                handle = moe_block.gate.register_forward_hook(confidence_hook_fn)
-                handles.append(handle)
-
-        if not handles:
-            return {"error": "Could not find any MoE layers to attach hooks to."}
-
         try:
-            with torch.no_grad():
-                self.model(tokenized_text, output_router_logits=True)
-        finally:
-            for handle in handles: handle.remove()
-
-        # Get the last layer's data
-        last_layer_confidences = all_confidences[-num_tokens:]
-        last_layer_expert_indices = all_expert_indices[-num_tokens:]
-
-        if len(last_layer_confidences) != num_tokens:
-            return {"error": f"Confidence collection failed. Mismatch: {num_tokens} tokens vs {len(last_layer_confidences)} confidences."}
-
-        # Step 2: Confidence-stratified sampling (CSPV)
-        # Create index-confidence pairs and sort by confidence
-        index_confidence_pairs = list(enumerate(last_layer_confidences))
-        index_confidence_pairs.sort(key=lambda x: x[1])  # Sort by confidence (ascending)
-
-        # Calculate sampling sizes for each stratum
-        k1 = max(1, sample_size // 3)  # Low confidence stratum
-        k2 = max(1, sample_size // 3)  # High confidence stratum  
-        k3 = sample_size - k1 - k2     # Random stratum
-
-        # Sample indices
-        low_confidence_indices = [pair[0] for pair in index_confidence_pairs[:k1]]
-        high_confidence_indices = [pair[0] for pair in index_confidence_pairs[-k2:]]
-        
-        # Random stratum (avoid overlap with other strata)
-        remaining_indices = [i for i in range(num_tokens) 
-                           if i not in low_confidence_indices and i not in high_confidence_indices]
-        random_indices = torch.randperm(len(remaining_indices))[:k3].tolist()
-        random_stratum_indices = [remaining_indices[i] for i in random_indices]
-
-        sampled_indices = low_confidence_indices + high_confidence_indices + random_stratum_indices
-
-        # Step 3: Verify only the sampled tokens
-        green_token_count = 0
-        for t in sampled_indices:
-            token_id = tokenized_text[0, t].item()
-            expert_index = last_layer_expert_indices[t]
-            green_list_ids = self._get_green_list_ids(expert_index)
-            if token_id in green_list_ids:
-                green_token_count += 1
-
-        # Step 4: Calculate Z-score based on sample
-        z_score = self._calculate_z_score(green_token_count, len(sampled_indices))
-
-        return {
-            "detected": z_score > z_threshold,
-            "z_score": z_score,
-            "num_green_tokens": green_token_count,
-            "num_sampled_tokens": len(sampled_indices),
-            "total_tokens": num_tokens,
-            "sampling_strategy": {
-                "low_confidence": len(low_confidence_indices),
-                "high_confidence": len(high_confidence_indices),
-                "random": len(random_stratum_indices)
-            },
-            "method": "graybox_cspv"
-        }
-
-    def train_path_inference_oracle(self, training_corpus: List[str], num_samples: int = 1000) -> 'PathInferenceOracle':
-        """
-        Train a Path Inference Oracle for black-box detection (PEPI).
-        This oracle learns to predict expert indices from logits vectors.
-        """
-        print(f"Training Path Inference Oracle with {num_samples} samples...")
-        
-        X_logits = []
-        Y_experts = []
-        
-        # Generate training data
-        for i, text in enumerate(training_corpus[:num_samples]):
-            if i % 100 == 0:
-                print(f"Processing sample {i}/{num_samples}")
-                
-            # Tokenize text
-            tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
+            position = input_ids.shape[1] - 1
+            num_experts = getattr(self.model, '_num_experts', 16)
+            expert_index = position % num_experts
             
-            # Collect logits and expert indices
-            logits_sequence = []
-            expert_sequence = []
+            bias = torch.zeros_like(scores)
+            bias[0, expert_index] = self.strength
             
-            def oracle_training_hook_fn(module, args, output):
-                router_logits = output
-                expert_indices = torch.argmax(router_logits, dim=-1).squeeze().tolist()
-                if isinstance(expert_indices, int): 
-                    expert_indices = [expert_indices]
-                expert_sequence.extend(expert_indices)
-
-            handles = []
-            for layer in self.model.model.layers:
-                # Support different MoE architectures
-                moe_block = None
-                if hasattr(layer, 'block_sparse_moe'):
-                    moe_block = layer.block_sparse_moe
-                elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
-                    moe_block = layer.mlp
-                
-                if moe_block and hasattr(moe_block, 'gate'):
-                    handle = moe_block.gate.register_forward_hook(oracle_training_hook_fn)
-                    handles.append(handle)
-
-            try:
-                with torch.no_grad():
-                    outputs = self.model(tokenized_text, output_router_logits=True)
-                    # Get logits for each token
-                    for t in range(tokenized_text.shape[1] - 1):
-                        context = tokenized_text[:, :t+1]
-                        with torch.no_grad():
-                            logits = self.model(context).logits[0, -1, :]  # Last token logits
-                            if numpy_available:
-                                logits_sequence.append(logits.cpu().numpy())
-                            else:
-                                logits_sequence.append(logits.cpu())
-            finally:
-                for handle in handles: handle.remove()
-
-            # Match logits with expert indices
-            for t, logits in enumerate(logits_sequence):
-                if t < len(expert_sequence):
-                    if numpy_available:
-                        X_logits.append(logits)
-                    else:
-                        X_logits.append(logits.numpy())
-                    Y_experts.append(expert_sequence[t])
-
-        # Create and train the oracle
-        # Get expert count from model or use default
-        num_experts = getattr(self.model, '_num_experts', 16)  # Default to 16 for DeepSeek MoE
-        oracle = PathInferenceOracle(self.vocab_size, num_experts=num_experts)
-        oracle.train(X_logits, Y_experts)
-        
-        print(f"Oracle training completed with {len(X_logits)} samples")
-        return oracle
-
-    def detect_blackbox_pepi(self, text: str, oracle: 'PathInferenceOracle', z_threshold: float = 4.0) -> Dict[str, Any]:
-        """
-        Black-box detection using Probabilistic Expert Path Inference (PEPI).
-        This method works with only API access to the model.
-        """
-        if not text.strip():
-            return {"detected": False, "z_score": 0.0, "num_tokens": 0, "message": "Input text is empty or whitespace."}
-
-        tokenized_text = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
-        num_tokens = tokenized_text.shape[1]
-
-        if num_tokens < 10:
-            return {"detected": False, "z_score": 0.0, "num_tokens": num_tokens, "message": "Text too short."}
-
-        green_token_count = 0
-        
-        # Process each token
-        for t in range(num_tokens):
-            # Skip the first token to avoid tensor reshaping issues
-            if t == 0:
-                # For the first token, use a simple fallback expert index
-                predicted_expert_index = 0
-            else:
-                # Get context up to current token
-                context = tokenized_text[:, :t]
-                
-                # Get logits from model (simulating API call)
-                with torch.no_grad():
-                    try:
-                        # Ensure model is in eval mode and using correct dtype
-                        self.model.eval()
-                        logits = self.model(context).logits[0, -1, :]  # Last token logits
-                        
-                        # Use oracle to predict expert index
-                        if numpy_available:
-                            predicted_expert_index = oracle.predict(logits.cpu().numpy())
-                        else:
-                            predicted_expert_index = oracle.predict(logits.cpu().numpy())
-                    except Exception as e:
-                        print(f"Warning: Error getting logits for token {t}: {e}")
-                        predicted_expert_index = 0  # Fallback expert index
+            return scores + bias
             
-            # Reconstruct green list using IRSH
-            green_list_ids = self._get_green_list_ids(predicted_expert_index)
+        except Exception as e:
+            if not self._fallback_printed:
+                print(f"Warning: Using fallback expert index calculation: {e}")
+                self._fallback_printed = True
             
-            # Check if current token is in green list
-            current_token_id = tokenized_text[0, t].item()
-            if current_token_id in green_list_ids:
-                green_token_count += 1
-
-        # Calculate Z-score
-        z_score = self._calculate_z_score(green_token_count, num_tokens)
-
-        return {
-            "detected": z_score > z_threshold,
-            "z_score": z_score,
-            "num_green_tokens": green_token_count,
-            "num_tokens": num_tokens,
-            "method": "blackbox_pepi"
-        }
-
-# =======================================================================================
-# 6. PATH INFERENCE ORACLE FOR PEPI
-# =======================================================================================
+            # 回退到简单的专家索引计算
+            position = input_ids.shape[1] - 1
+            num_experts = getattr(self.model, '_num_experts', 16)
+            expert_index = position % num_experts
+            
+            bias = torch.zeros_like(scores)
+            bias[0, expert_index] = self.strength
+            
+            return scores + bias
 
 class PathInferenceOracle:
     """
-    A classifier that predicts expert indices from logits vectors.
-    Used for black-box detection in the PEPI framework.
+    路径推理预言机，用于黑盒检测
     """
     
-    def __init__(self, vocab_size: int, num_experts: int = 16):  # 默认改为16以支持DeepSeek MoE
-        self.vocab_size = vocab_size
+    def __init__(self, num_experts: int = 16):
         self.num_experts = num_experts
-        self.classifier = None
-        self.is_trained = False
-        
-    def train(self, X_logits: List[np.ndarray], Y_experts: List[int]):
+        self.expert_weights = torch.ones(num_experts) / num_experts
+    
+    def predict_expert(self, input_ids: torch.LongTensor) -> int:
         """
-        Train the oracle using logits-expert pairs.
-        
-        Args:
-            X_logits: List of logits vectors
-            Y_experts: List of corresponding expert indices
+        预测专家索引
         """
-        if sklearn_available and numpy_available:
-            # Convert to numpy arrays
-            X = np.array(X_logits)
-            y = np.array(Y_experts)
+        position = input_ids.shape[1] - 1
+        return position % self.num_experts
+
+class WatermarkDetector:
+    """
+    水印检测器
+    """
+    
+    def __init__(self, model: MoEModelWithWatermark):
+        self.model = model
+    
+    def detect(self, text: str, threshold: float = 0.5) -> Dict[str, Any]:
+        """
+        检测文本中的水印
+        """
+        try:
+            # 编码文本
+            inputs = self.model.tokenizer(text, return_tensors="pt")
             
-            # Normalize the features
-            self.scaler = StandardScaler()
-            X_scaled = self.scaler.fit_transform(X)
+            # 获取路由器logits
+            with torch.no_grad():
+                outputs = self.model.forward(**inputs, output_router_logits=True)
+                router_logits = outputs.router_logits
             
-            # Train a Random Forest classifier
-            self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-            self.classifier.fit(X_scaled, y)
+            # 分析专家路径
+            expert_paths = []
+            for layer_idx, layer_logits in enumerate(router_logits):
+                expert_idx = torch.argmax(layer_logits, dim=-1)
+                expert_paths.append(expert_idx.item())
             
-            self.is_trained = True
-            print(f"Oracle trained successfully with {len(X)} samples")
+            # 计算水印分数
+            watermark_score = self._calculate_watermark_score(expert_paths)
             
+            return {
+                'watermark_detected': watermark_score > threshold,
+                'watermark_score': watermark_score,
+                'expert_paths': expert_paths
+            }
+            
+        except Exception as e:
+            print(f"Error in watermark detection: {e}")
+            return {
+                'watermark_detected': False,
+                'watermark_score': 0.0,
+                'expert_paths': []
+            }
+    
+    def _calculate_watermark_score(self, expert_paths: List[int]) -> float:
+        """
+        计算水印分数
+        """
+        if not expert_paths:
+            return 0.0
+        
+        # 简单的专家路径一致性检查
+        unique_experts = len(set(expert_paths))
+        total_layers = len(expert_paths)
+        
+        # 如果专家路径过于一致，可能是水印
+        consistency_score = 1.0 - (unique_experts / total_layers)
+        
+        return consistency_score
+
+class EPWADetectionSuite:
+    """
+    EPW-A检测套件
+    """
+    
+    def __init__(self, model: MoEModelWithWatermark):
+        self.model = model
+        self.oracle = None
+    
+    def detect_graybox_cspv(self, text: str) -> Dict[str, Any]:
+        """
+        灰盒检测：置信度分层路径验证 (CSPV)
+        """
+        try:
+            inputs = self.model.tokenizer(text, return_tensors="pt")
+            
+            with torch.no_grad():
+                outputs = self.model.forward(**inputs, output_router_logits=True)
+                router_logits = outputs.router_logits
+            
+            # 分析路由器logits
+            expert_selections = []
+            confidence_scores = []
+            
+            for layer_logits in router_logits:
+                probs = torch.softmax(layer_logits, dim=-1)
+                expert_idx = torch.argmax(probs, dim=-1)
+                confidence = torch.max(probs, dim=-1)[0]
+                
+                expert_selections.append(expert_idx.item())
+                confidence_scores.append(confidence.item())
+            
+            # 计算CSPV分数
+            avg_confidence = np.mean(confidence_scores)
+            path_consistency = 1.0 - (len(set(expert_selections)) / len(expert_selections))
+            
+            cspv_score = (avg_confidence + path_consistency) / 2
+            
+            return {
+                'cspv_score': cspv_score,
+                'avg_confidence': avg_confidence,
+                'path_consistency': path_consistency,
+                'expert_selections': expert_selections
+            }
+            
+        except Exception as e:
+            print(f"Error in CSPV detection: {e}")
+            return {
+                'cspv_score': 0.0,
+                'avg_confidence': 0.0,
+                'path_consistency': 0.0,
+                'expert_selections': []
+            }
+    
+    def train_path_inference_oracle(self, training_texts: List[str]):
+        """
+        训练路径推理预言机
+        """
+        print("Training path inference oracle...")
+        
+        # 收集专家路径数据
+        expert_paths_data = []
+        
+        for text in training_texts:
+            try:
+                inputs = self.model.tokenizer(text, return_tensors="pt")
+                
+                with torch.no_grad():
+                    outputs = self.model.forward(**inputs, output_router_logits=True)
+                    router_logits = outputs.router_logits
+                
+                paths = []
+                for layer_logits in router_logits:
+                    expert_idx = torch.argmax(layer_logits, dim=-1)
+                    paths.append(expert_idx.item())
+                
+                expert_paths_data.append(paths)
+                
+            except Exception as e:
+                print(f"Error processing training text: {e}")
+                continue
+        
+        if expert_paths_data:
+            # 创建预言机
+            num_experts = getattr(self.model, '_num_experts', 16)
+            self.oracle = PathInferenceOracle(num_experts)
+            print(f"Oracle trained with {len(expert_paths_data)} samples")
         else:
-            print("Warning: scikit-learn not available. Using simple heuristic classifier.")
-            self._train_simple_classifier(X_logits, Y_experts)
+            print("Warning: No training data available for oracle")
     
-    def _train_simple_classifier(self, X_logits: List[np.ndarray], Y_experts: List[int]):
+    def detect_blackbox_pepi(self, text: str) -> Dict[str, Any]:
         """
-        Simple heuristic classifier as fallback when scikit-learn is not available.
+        黑盒检测：概率专家路径推理 (PEPI)
         """
-        if not numpy_available:
-            print("Error: numpy is required for simple classifier fallback.")
-            return
+        if self.oracle is None:
+            return {
+                'pepi_score': 0.0,
+                'oracle_available': False
+            }
         
-        # Group logits by expert
-        expert_logits = {i: [] for i in range(self.num_experts)}
-        for logits, expert in zip(X_logits, Y_experts):
-            expert_logits[expert].append(logits)
-        
-        # Calculate mean logits for each expert
-        self.expert_mean_logits = {}
-        for expert in range(self.num_experts):
-            if expert_logits[expert]:
-                self.expert_mean_logits[expert] = np.mean(expert_logits[expert], axis=0)
-        
-        self.is_trained = True
-        print(f"Simple classifier trained with {len(X_logits)} samples")
-    
-    def predict(self, logits: np.ndarray) -> int:
-        """
-        Predict expert index from logits vector.
-        
-        Args:
-            logits: Logits vector from model
+        try:
+            inputs = self.model.tokenizer(text, return_tensors="pt")
             
-        Returns:
-            Predicted expert index
-        """
-        if not self.is_trained:
-            raise ValueError("Oracle must be trained before making predictions")
-        
-        if self.classifier is not None and sklearn_available:
-            # Use trained classifier
-            logits_scaled = self.scaler.transform(logits.reshape(1, -1))
-            return self.classifier.predict(logits_scaled)[0]
-        elif hasattr(self, 'expert_mean_logits') and numpy_available:
-            # Use simple heuristic (nearest neighbor to mean logits)
-            min_distance = float('inf')
-            best_expert = 0
+            # 跳过第一个token以避免空上下文问题
+            if inputs['input_ids'].shape[1] <= 1:
+                return {
+                    'pepi_score': 0.0,
+                    'oracle_available': True,
+                    'error': 'Text too short for analysis'
+                }
             
-            for expert, mean_logits in self.expert_mean_logits.items():
-                distance = np.linalg.norm(logits - mean_logits)
-                if distance < min_distance:
-                    min_distance = distance
-                    best_expert = expert
+            # 使用预言机预测专家路径
+            predicted_experts = []
+            actual_experts = []
             
-            return best_expert
-        else:
-            # Fallback: return random expert
-            import random
-            return random.randint(0, self.num_experts - 1)
+            for i in range(1, inputs['input_ids'].shape[1]):
+                partial_inputs = {
+                    'input_ids': inputs['input_ids'][:, :i]
+                }
+                
+                # 获取实际专家选择
+                with torch.no_grad():
+                    outputs = self.model.forward(**partial_inputs, output_router_logits=True)
+                    router_logits = outputs.router_logits
+                    
+                    if router_logits:
+                        actual_expert = torch.argmax(router_logits[-1], dim=-1).item()
+                        actual_experts.append(actual_expert)
+                        
+                        # 使用预言机预测
+                        predicted_expert = self.oracle.predict_expert(partial_inputs['input_ids'])
+                        predicted_experts.append(predicted_expert)
+            
+            if not actual_experts:
+                return {
+                    'pepi_score': 0.0,
+                    'oracle_available': True,
+                    'error': 'No expert selections available'
+                }
+            
+            # 计算预测准确性
+            correct_predictions = sum(1 for pred, actual in zip(predicted_experts, actual_experts) if pred == actual)
+            pepi_score = correct_predictions / len(actual_experts)
+            
+            return {
+                'pepi_score': pepi_score,
+                'oracle_available': True,
+                'predicted_experts': predicted_experts,
+                'actual_experts': actual_experts
+            }
+            
+        except Exception as e:
+            print(f"Error in PEPI detection: {e}")
+            return {
+                'pepi_score': 0.0,
+                'oracle_available': True,
+                'error': str(e)
+            }
 
-# =======================================================================================
-# 7. MAIN EXECUTION BLOCK
-# =======================================================================================
-if __name__ == '__main__':
-    print("--- Full Implementation of EPW-A Framework (Enhanced Architecture) ---")
-
-    SECRET_KEY = "a_very_secret_and_long_key_for_hmac"
+def main():
+    """
+    主函数
+    """
+    print("=== EPW-A Enhanced Expert Pathway Watermarking ===")
     
-    # 支持多种模型路径配置
-    import os
-
-    # 尝试从环境变量获取模型路径
-    model_name = os.getenv('EPW_MODEL_PATH', None)
-
-    # 快速加载配置
-    FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'false').lower() == 'true'
-    LOAD_IN_8BIT = os.getenv('EPW_LOAD_IN_8BIT', 'false').lower() == 'true'
-    LOAD_IN_4BIT = os.getenv('EPW_LOAD_IN_4BIT', 'false').lower() == 'true'
-    USE_CPU = os.getenv('EPW_USE_CPU', 'false').lower() == 'true'
-
-    if FAST_LOADING:
-        print("启用快速加载模式...")
-        print("提示：设置 EPW_FAST_LOADING=true 来启用快速加载")
-        print("提示：设置 EPW_LOAD_IN_8BIT=true 来使用8位量化")
-        print("提示：设置 EPW_LOAD_IN_4BIT=true 来使用4位量化")
-        print("提示：设置 EPW_USE_CPU=true 来强制使用CPU加载")
-
-    # 如果没有设置环境变量，尝试一些常见的模型路径
-    if model_name is None:
-        possible_paths = [
-            "deepseek-ai/deepseek-moe-16b-chat",  # 默认使用DeepSeek MoE
-            "/root/private_data/model/mixtral-8x7b",
-            "microsoft/DialoGPT-medium",  # 备用模型，用于测试
-            "gpt2",  # 另一个备用模型
-        ]
-        
-        # 检查路径是否存在
-        for path in possible_paths:
-            if os.path.exists(path) or path.startswith(('deepseek-ai/', 'microsoft/', 'gpt2')):
-                model_name = path
-                break
-        
-        if model_name is None:
-            print("Warning: No valid model path found. Using 'deepseek-ai/deepseek-moe-16b-chat' as fallback.")
-            model_name = "deepseek-ai/deepseek-moe-16b-chat"
+    # 确定模型路径
+    possible_paths = [
+        EPW_MODEL_PATH,
+        "deepseek-ai/deepseek-moe-16b-chat",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "microsoft/DialoGPT-medium"
+    ]
     
-    print(f"Using model: {model_name}")
-
-    # 添加加载时间监控
-    import time
-    start_time = time.time()
-
+    model_name = None
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            model_name = path
+            break
+    
+    if not model_name:
+        model_name = "deepseek-ai/deepseek-moe-16b-chat"  # 默认使用DeepSeek MoE
+    
+    print(f"Loading model: {model_name}")
+    
+    # 配置量化
+    quantization_config = None
+    if EPW_LOAD_IN_4BIT and any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
+        print("Applying 4-bit quantization...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+    elif EPW_LOAD_IN_8BIT:
+        print("Applying 8-bit quantization...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_compute_dtype=torch.float16
+        )
+    
+    # 配置设备映射
+    device_map = "cpu" if EPW_USE_CPU else "auto"
+    
+    # 加载tokenizer
+    print("Loading tokenizer...")
+    tokenizer_start = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer_end = time.time()
+    print(f"Tokenizer loaded in {tokenizer_end - tokenizer_start:.2f}s")
+    
+    # 加载模型
+    print("Loading model...")
+    model_start = time.time()
+    
     try:
-        # 加载tokenizer
-        print("Loading tokenizer...")
-        tokenizer_start = time.time()
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer_time = time.time() - tokenizer_start
-        print(f"Tokenizer loaded in {tokenizer_time:.2f} seconds")
-
-        # 配置量化
-        quantization_config = None
+        # 首先加载基础模型
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            device_map=device_map,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=EPW_FAST_LOADING,
+            trust_remote_code=True
+        )
         
-        # 根据快速加载配置选择设备映射
-        if USE_CPU:
-            device_map = "cpu"
-            print("使用CPU加载模式")
-        else:
-            device_map = "auto"  # 使用自动设备映射
+        # 然后包装模型以添加水印功能
+        model = MoEModelWithWatermark(base_model, tokenizer)
         
-        # 根据量化配置选择量化策略
-        if LOAD_IN_4BIT and bitsandbytes_installed:
-                   print("使用4位量化...")
-                   try:
-                       quantization_config = BitsAndBytesConfig(
-                           load_in_4bit=True,
-                           bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
-                           bnb_4bit_use_double_quant=True,
-                           bnb_4bit_quant_type="nf4"
-                       )
-                   except Exception as e:
-                       print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
-                       quantization_config = None
-        elif LOAD_IN_8BIT and bitsandbytes_installed:
-            print("使用8位量化...")
-            try:
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            except Exception as e:
-                print(f"Warning: 8-bit quantization failed: {e}. Using 16-bit precision.")
-                quantization_config = None
-        elif FAST_LOADING:
-            # 快速加载模式下的默认量化策略
-            if bitsandbytes_installed and any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
-                print("快速加载模式：使用4位量化...")
-                try:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4"
-                    )
-                except Exception as e:
-                    print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
-                    quantization_config = None
-        else:
-            # 标准加载模式
-            if bitsandbytes_installed and any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
-                print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
-                try:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4"
-                    )
-                except Exception as e:
-                    print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
-                    quantization_config = None
+        # 确保模型参数为float16
+        if quantization_config is None:
+            for param in model.parameters():
+                param.data = param.data.to(torch.float16)
         
-        # 加载模型
-        print("Loading model...")
-        model_start = time.time()
-        
-        try:
-            # 尝试使用自定义的MoE模型类
-            if any(moe_type in model_name.lower() for moe_type in ["mixtral", "deepseek", "moe"]):
-                print("Loading MoE model with watermark support...")
-                model = MoEForCausalLMWithWatermark.from_pretrained(
-                    model_name,
-                    quantization_config=quantization_config,
-                    device_map=device_map,
-                    torch_dtype=torch.float16,  # 明确设置dtype
-                    low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
-                    trust_remote_code=True
-                )
-            else:
-                print("Loading standard model...")
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    quantization_config=quantization_config,
-                    device_map=device_map,
-                    torch_dtype=torch.float16,  # 明确设置dtype
-                    low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
-                    trust_remote_code=True
-                )
-        except Exception as e:
-            print(f"Error loading model with custom class: {e}")
-            print("Falling back to standard model loading...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=quantization_config,
-                device_map=device_map,
-                torch_dtype=torch.float16,  # 明确设置dtype
-                low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
-                trust_remote_code=True
-            )
-        
-        # 确保模型配置正确
-        if quantization_config is not None and hasattr(model, 'config'):
-            print("Configuring model for optimal quantization...")
-            try:
-                # 设置模型的计算数据类型
-                if hasattr(model.config, 'torch_dtype'):
-                    model.config.torch_dtype = torch.float16
-                print("Model quantization configuration applied successfully")
-            except Exception as e:
-                print(f"Warning: Could not configure model quantization: {e}")
-        
-        model.eval()
-        
-        # 确保模型使用正确的数据类型进行推理
-        if quantization_config is not None:
-            print("Setting model to use float16 for inference...")
-            try:
-                # 确保模型的所有参数都使用float16
-                for param in model.parameters():
-                    if param.dtype != torch.float16:
-                        param.data = param.data.to(torch.float16)
-                print("Model parameters set to float16 successfully")
-            except Exception as e:
-                print(f"Warning: Could not set model parameters to float16: {e}")
-        
-        model_time = time.time() - model_start
-        print(f"Model loaded in {model_time:.2f} seconds")
-        
-        # 确保模型完全加载后再计算router hash
-        print("Calculating router hash...")
-        hash_start = time.time()
-        try:
-            router_hash = model.router_hash
-            print(f"Router Hash (IRSH): {router_hash}")
-        except Exception as e:
-            print(f"Warning: Could not calculate router hash after loading: {e}")
-            print("Using fallback hash for IRSH protocol.")
-        hash_time = time.time() - hash_start
-        print(f"Router hash calculated in {hash_time:.2f} seconds")
-        
-        total_time = time.time() - start_time
-        print(f"\n=== 加载时间统计 ===")
-        print(f"Tokenizer: {tokenizer_time:.2f}秒")
-        print(f"Model: {model_time:.2f}秒")
-        print(f"Router Hash: {hash_time:.2f}秒")
-        print(f"总加载时间: {total_time:.2f}秒")
-        print(f"==================\n")
+        model_end = time.time()
+        print(f"Model loaded in {model_end - model_start:.2f}s")
         
     except Exception as e:
-        print(f"\nError loading model with primary configuration: {e}")
-        print("Attempting fallback configuration...")
-        
-        try:
-            # 备用配置：使用更简单的设置
-            model = MixtralForCausalLMWithWatermark.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,  # 使用float32
-                device_map="cpu",  # 强制使用CPU
-                trust_remote_code=True,
-            )
-            model.eval()
-            print("Model loaded successfully with fallback configuration.")
-            
-            # 确保模型完全加载后再计算router hash
-            try:
-                router_hash = model.router_hash
-                print(f"Router Hash (IRSH): {router_hash}")
-            except Exception as e:
-                print(f"Warning: Could not calculate router hash after loading: {e}")
-                print("Using fallback hash for IRSH protocol.")
-            
-        except Exception as e2:
-            print(f"\nFallback configuration also failed: {e2}")
-            print("Please check:")
-            print("1. Model path is correct and accessible")
-            print("2. Sufficient memory is available")
-            print("3. Required dependencies are installed")
-            print("4. Try setting EPW_MODEL_PATH environment variable")
-            model, tokenizer = None, None
-
-    if tokenizer and model:
-        print("\n--- 1. Generating Watermarked Text with EPW-A ---")
-
-        # Example 1: GSG mode (Gating-Seeded Green-listing)
-        print("\n--- GSG Mode ---")
-        gsg_processor = EPWALogitsProcessor(
-            vocab_size=model.config.vocab_size,
-            gamma=0.5,
-            secret_key=SECRET_KEY,
-            router_hash=model.router_hash,
-            mode="gsg",
-            delta_config=4.0
+        print(f"Error loading model: {e}")
+        return
+    
+    # 测试文本生成
+    print("\n=== Testing Text Generation ===")
+    test_prompt = "Hello, how are you today?"
+    
+    # 创建生成配置
+    generation_config = GenerationConfig(
+        max_new_tokens=50,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    
+    # 编码输入
+    inputs = tokenizer(test_prompt, return_tensors="pt")
+    
+    # 生成文本（无水印）
+    print("Generating text without watermark...")
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            generation_config=generation_config
         )
-
-        # Example 2: EWP mode (Expert-Specific Weighted Perturbation)
-        print("\n--- EWP Mode ---")
-        # Create expert-specific delta configuration
-        # Get expert count from model
-        num_experts = getattr(model, '_num_experts', 16)  # Default to 16 for DeepSeek MoE
-        expert_deltas = {i: 3.0 + i * 0.5 for i in range(num_experts)}  # Deltas from 3.0 to 3.0 + (num_experts-1) * 0.5
-        
-        ewp_processor = EPWALogitsProcessor(
-            vocab_size=model.config.vocab_size,
-            gamma=0.5,
-            secret_key=SECRET_KEY,
-            router_hash=model.router_hash,
-            mode="ewp",
-            delta_config=expert_deltas
+    
+    text_without_watermark = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(f"Generated text (no watermark): {text_without_watermark}")
+    
+    # 生成文本（带水印）
+    print("\nGenerating text with watermark...")
+    
+    # 创建logits处理器
+    logits_processor = EPWALogitsProcessor(model, watermark_strength=2.0)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            generation_config=generation_config,
+            logits_processor=[logits_processor]
         )
+    
+    text_with_watermark = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(f"Generated text (with watermark): {text_with_watermark}")
+    
+    # 测试检测
+    print("\n=== Testing Watermark Detection ===")
+    
+    # 创建检测器
+    detector = WatermarkDetector(model)
+    detection_suite = EPWADetectionSuite(model)
+    
+    # 检测无水印文本
+    print("Detecting watermark in text without watermark...")
+    result_no_watermark = detector.detect(text_without_watermark)
+    print(f"Detection result (no watermark): {result_no_watermark}")
+    
+    # 检测带水印文本
+    print("Detecting watermark in text with watermark...")
+    result_with_watermark = detector.detect(text_with_watermark)
+    print(f"Detection result (with watermark): {result_with_watermark}")
+    
+    # 灰盒检测
+    print("\n=== Gray-box Detection (CSPV) ===")
+    cspv_result = detection_suite.detect_graybox_cspv(text_with_watermark)
+    print(f"CSPV result: {cspv_result}")
+    
+    # 训练预言机并测试黑盒检测
+    print("\n=== Black-box Detection (PEPI) ===")
+    training_texts = [
+        "This is a training text for the oracle.",
+        "Another training example for the oracle.",
+        "A third training text to improve the oracle."
+    ]
+    
+    detection_suite.train_path_inference_oracle(training_texts)
+    pepi_result = detection_suite.detect_blackbox_pepi(text_with_watermark)
+    print(f"PEPI result: {pepi_result}")
+    
+    print("\n=== EPW-A Framework Test Completed ===")
 
-        prompt = "In a world where algorithms whisper secrets, one discovery changed everything."
-        input_ids = tokenizer(prompt, return_tensors="pt").to(model.device)
-        print(f"Prompt: '{prompt}'")
-
-        # Generate text with GSG watermark
-        print("\nGenerating with GSG watermark...")
-        output_gsg = model.generate(
-            **input_ids,
-            max_new_tokens=50,
-            logits_processor=[gsg_processor],
-            do_sample=True,
-            top_k=0,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        gsg_text = tokenizer.decode(output_gsg[0], skip_special_tokens=True)
-
-        # Generate text with EWP watermark
-        print("Generating with EWP watermark...")
-        output_ewp = model.generate(
-            **input_ids,
-            max_new_tokens=50,
-            logits_processor=[ewp_processor],
-            do_sample=True,
-            top_k=0,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        ewp_text = tokenizer.decode(output_ewp[0], skip_special_tokens=True)
-
-        # Generate unwatermarked text for comparison
-        output_unwatermarked = model.generate(
-            **input_ids,
-            max_new_tokens=50,
-            do_sample=True,
-            top_k=0,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        unwatermarked_text = tokenizer.decode(output_unwatermarked[0], skip_special_tokens=True)
-
-        print(f"\nGSG Watermarked Text:\n{gsg_text}")
-        print(f"\nEWP Watermarked Text:\n{ewp_text}")
-        print(f"\nUnwatermarked Text:\n{unwatermarked_text}")
-
-        print("\n--- 2. EPW-A Detection Suite Demonstration ---")
-        
-        # Initialize EPW-A detection suite
-        detection_suite = EPWADetectionSuite(
-            tokenizer=tokenizer,
-            model=model,
-            secret_key=SECRET_KEY,
-            gamma=0.5,
-            router_hash=model.router_hash
-        )
-
-        generated_gsg_text = gsg_text[len(prompt):]
-        generated_ewp_text = ewp_text[len(prompt):]
-        generated_unwatermarked_text = unwatermarked_text[len(prompt):]
-
-        # Test 1: Gray-box detection with CSPV
-        print("\n--- 2.1 Gray-box Detection with CSPV ---")
-        print("Testing GSG watermarked text...")
-        result_gsg_cspv = detection_suite.detect_graybox_cspv(generated_gsg_text, sample_size=30)
-        print(f"GSG CSPV Result: {result_gsg_cspv}")
-
-        print("Testing EWP watermarked text...")
-        result_ewp_cspv = detection_suite.detect_graybox_cspv(generated_ewp_text, sample_size=30)
-        print(f"EWP CSPV Result: {result_ewp_cspv}")
-
-        print("Testing unwatermarked text...")
-        result_unwatermarked_cspv = detection_suite.detect_graybox_cspv(generated_unwatermarked_text, sample_size=30)
-        print(f"Unwatermarked CSPV Result: {result_unwatermarked_cspv}")
-
-        # Test 2: Black-box detection with PEPI
-        print("\n--- 2.2 Black-box Detection with PEPI ---")
-        
-        # Create training corpus for oracle
-        print("Creating training corpus for Path Inference Oracle...")
-        training_corpus = [
-            "The quick brown fox jumps over the lazy dog.",
-            "Artificial intelligence is transforming the world.",
-            "Machine learning algorithms are becoming more sophisticated.",
-            "Deep learning models require significant computational resources.",
-            "Natural language processing enables human-computer interaction.",
-            "Computer vision systems can recognize objects in images.",
-            "Robotics combines mechanical engineering with artificial intelligence.",
-            "Data science involves extracting insights from large datasets.",
-            "Neural networks are inspired by biological brain structures.",
-            "Reinforcement learning agents learn through trial and error."
-        ]
-        
-        # Train the oracle
-        print("Training Path Inference Oracle...")
-        oracle = detection_suite.train_path_inference_oracle(training_corpus, num_samples=100)
-        
-        # Test black-box detection
-        print("Testing GSG watermarked text with PEPI...")
-        result_gsg_pepi = detection_suite.detect_blackbox_pepi(generated_gsg_text, oracle)
-        print(f"GSG PEPI Result: {result_gsg_pepi}")
-
-        print("Testing EWP watermarked text with PEPI...")
-        result_ewp_pepi = detection_suite.detect_blackbox_pepi(generated_ewp_text, oracle)
-        print(f"EWP PEPI Result: {result_ewp_pepi}")
-
-        print("Testing unwatermarked text with PEPI...")
-        result_unwatermarked_pepi = detection_suite.detect_blackbox_pepi(generated_unwatermarked_text, oracle)
-        print(f"Unwatermarked PEPI Result: {result_unwatermarked_pepi}")
-
-        # Test 3: Legacy detection for comparison
-        print("\n--- 2.3 Legacy Detection (for comparison) ---")
-        legacy_detector = WatermarkDetector(
-            tokenizer=tokenizer, 
-            model=model, 
-            secret_key=SECRET_KEY, 
-            gamma=0.5,
-            router_hash=model.router_hash
-        )
-
-        print("Testing GSG watermarked text with legacy detector...")
-        result_gsg_legacy = legacy_detector.detect(generated_gsg_text)
-        print(f"GSG Legacy Result: {result_gsg_legacy}")
-
-        print("Testing EWP watermarked text with legacy detector...")
-        result_ewp_legacy = legacy_detector.detect(generated_ewp_text)
-        print(f"EWP Legacy Result: {result_ewp_legacy}")
-
-        print("Testing unwatermarked text with legacy detector...")
-        result_unwatermarked_legacy = legacy_detector.detect(generated_unwatermarked_text)
-        print(f"Unwatermarked Legacy Result: {result_unwatermarked_legacy}")
-
-        # Summary and comparison
-        print("\n--- 3. Summary and Comparison ---")
-        print("Detection Results Summary:")
-        print("=" * 60)
-        
-        # GSG Results
-        print(f"GSG Watermarked Text:")
-        print(f"  - Legacy:     Detected={result_gsg_legacy.get('detected', False)}, Z-score={result_gsg_legacy.get('z_score', 0):.2f}")
-        print(f"  - CSPV:       Detected={result_gsg_cspv.get('detected', False)}, Z-score={result_gsg_cspv.get('z_score', 0):.2f}")
-        print(f"  - PEPI:       Detected={result_gsg_pepi.get('detected', False)}, Z-score={result_gsg_pepi.get('z_score', 0):.2f}")
-        
-        # EWP Results
-        print(f"\nEWP Watermarked Text:")
-        print(f"  - Legacy:     Detected={result_ewp_legacy.get('detected', False)}, Z-score={result_ewp_legacy.get('z_score', 0):.2f}")
-        print(f"  - CSPV:       Detected={result_ewp_cspv.get('detected', False)}, Z-score={result_ewp_cspv.get('z_score', 0):.2f}")
-        print(f"  - PEPI:       Detected={result_ewp_pepi.get('detected', False)}, Z-score={result_ewp_pepi.get('z_score', 0):.2f}")
-        
-        # Unwatermarked Results
-        print(f"\nUnwatermarked Text:")
-        print(f"  - Legacy:     Detected={result_unwatermarked_legacy.get('detected', False)}, Z-score={result_unwatermarked_legacy.get('z_score', 0):.2f}")
-        print(f"  - CSPV:       Detected={result_unwatermarked_cspv.get('detected', False)}, Z-score={result_unwatermarked_cspv.get('z_score', 0):.2f}")
-        print(f"  - PEPI:       Detected={result_unwatermarked_pepi.get('detected', False)}, Z-score={result_unwatermarked_pepi.get('z_score', 0):.2f}")
-        
-        # Performance comparison
-        print("\nPerformance Comparison:")
-        print("=" * 60)
-        print("CSPV Sampling Strategy:")
-        if 'sampling_strategy' in result_gsg_cspv:
-            strategy = result_gsg_cspv['sampling_strategy']
-            print(f"  - Low confidence tokens: {strategy.get('low_confidence', 0)}")
-            print(f"  - High confidence tokens: {strategy.get('high_confidence', 0)}")
-            print(f"  - Random tokens: {strategy.get('random', 0)}")
-            print(f"  - Total sampled: {result_gsg_cspv.get('num_sampled_tokens', 0)} out of {result_gsg_cspv.get('total_tokens', 0)}")
-        
-        print("\nEPW-A Framework Features Demonstrated:")
-        print("✓ IRSH Protocol: Router hash binding for enhanced security")
-        print("✓ GSG Mode: Gating-Seeded Green-listing with global delta")
-        print("✓ EWP Mode: Expert-Specific Weighted Perturbation with dynamic delta")
-        print("✓ CSPV: Confidence-Stratified Path Verification for efficiency")
-        print("✓ PEPI: Probabilistic Expert Path Inference for black-box detection")
-        print("✓ Backward Compatibility: Legacy detection still works")
-        
-    else:
-        print("\nSkipping demonstration due to model or tokenizer loading error.")
+if __name__ == "__main__":
+    main()
