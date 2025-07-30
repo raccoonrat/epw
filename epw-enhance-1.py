@@ -4,9 +4,12 @@ Enhanced implementation with improved model loading and watermarking capabilitie
 
 快速加载优化说明：
 1. 设置环境变量 EPW_FAST_LOADING=true 启用快速加载模式
-2. 设置环境变量 EPW_LOAD_IN_8BIT=true 使用8位量化（更快但精度稍低）
-3. 设置环境变量 EPW_USE_CPU=true 强制使用CPU加载（避免GPU内存分配时间）
-4. 设置环境变量 EPW_MODEL_PATH 指定模型路径
+2. 设置环境变量 EPW_LOAD_IN_4BIT=true 使用4位量化（最快但精度较低）
+3. 设置环境变量 EPW_LOAD_IN_8BIT=true 使用8位量化（较快但精度稍低）
+4. 设置环境变量 EPW_USE_CPU=true 强制使用CPU加载（避免GPU内存分配时间）
+5. 设置环境变量 EPW_MODEL_PATH 指定模型路径
+
+量化优先级：EPW_LOAD_IN_4BIT > EPW_LOAD_IN_8BIT > 快速加载默认4位 > 标准加载默认4位
 
 加载时间优化建议：
 - 使用SSD存储模型文件
@@ -832,12 +835,14 @@ if __name__ == '__main__':
     # 快速加载配置
     FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'false').lower() == 'true'
     LOAD_IN_8BIT = os.getenv('EPW_LOAD_IN_8BIT', 'false').lower() == 'true'
+    LOAD_IN_4BIT = os.getenv('EPW_LOAD_IN_4BIT', 'false').lower() == 'true'
     USE_CPU = os.getenv('EPW_USE_CPU', 'false').lower() == 'true'
 
     if FAST_LOADING:
         print("启用快速加载模式...")
         print("提示：设置 EPW_FAST_LOADING=true 来启用快速加载")
         print("提示：设置 EPW_LOAD_IN_8BIT=true 来使用8位量化")
+        print("提示：设置 EPW_LOAD_IN_4BIT=true 来使用4位量化")
         print("提示：设置 EPW_USE_CPU=true 来强制使用CPU加载")
 
     # 如果没有设置环境变量，尝试一些常见的模型路径
@@ -884,17 +889,25 @@ if __name__ == '__main__':
         else:
             device_map = "auto"  # 使用自动设备映射
         
-        # 根据快速加载配置选择量化策略
-        if FAST_LOADING:
-            if LOAD_IN_8BIT and bitsandbytes_installed:
-                print("使用8位量化进行快速加载...")
-                try:
-                    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-                except Exception as e:
-                    print(f"Warning: 8-bit quantization failed: {e}. Using 4-bit quantization.")
-                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-            elif bitsandbytes_installed and "mixtral" in model_name.lower():
-                print("使用4位量化进行快速加载...")
+        # 根据量化配置选择量化策略
+        if LOAD_IN_4BIT and bitsandbytes_installed:
+            print("使用4位量化...")
+            try:
+                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            except Exception as e:
+                print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
+                quantization_config = None
+        elif LOAD_IN_8BIT and bitsandbytes_installed:
+            print("使用8位量化...")
+            try:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            except Exception as e:
+                print(f"Warning: 8-bit quantization failed: {e}. Using 16-bit precision.")
+                quantization_config = None
+        elif FAST_LOADING:
+            # 快速加载模式下的默认量化策略
+            if bitsandbytes_installed and "mixtral" in model_name.lower():
+                print("快速加载模式：使用4位量化...")
                 try:
                     quantization_config = BitsAndBytesConfig(load_in_4bit=True)
                 except Exception as e:

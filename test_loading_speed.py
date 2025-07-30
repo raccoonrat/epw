@@ -73,15 +73,23 @@ def main():
             "env_vars": {"EPW_FAST_LOADING": "true"}
         },
         {
+            "name": "4位量化",
+            "env_vars": {"EPW_LOAD_IN_4BIT": "true"}
+        },
+        {
             "name": "8位量化",
-            "env_vars": {
-                "EPW_FAST_LOADING": "true",
-                "EPW_LOAD_IN_8BIT": "true"
-            }
+            "env_vars": {"EPW_LOAD_IN_8BIT": "true"}
         },
         {
             "name": "CPU模式",
             "env_vars": {"EPW_USE_CPU": "true"}
+        },
+        {
+            "name": "4位量化+CPU",
+            "env_vars": {
+                "EPW_LOAD_IN_4BIT": "true",
+                "EPW_USE_CPU": "true"
+            }
         },
         {
             "name": "快速加载+CPU",
@@ -103,10 +111,11 @@ def main():
     print("测试总结")
     print(f"{'='*50}")
     print("建议根据您的硬件配置选择合适的加载方式：")
+    print("- 如果追求最快速度且精度要求不高：使用4位量化")
     print("- 如果内存充足且使用GPU：使用快速加载模式")
     print("- 如果内存有限：使用8位量化")
     print("- 如果GPU显存不足：使用CPU模式")
-    print("- 如果追求最快速度：使用8位量化+CPU模式")
+    print("- 如果追求最快速度：使用4位量化+CPU模式")
 
 if __name__ == "__main__":
     main() 

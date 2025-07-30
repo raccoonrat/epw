@@ -38,6 +38,8 @@ pip install -r requirements.txt
 
 ## 🎯 快速开始
 
+### 基本使用
+
 ```python
 # 基本使用示例
 from epw_enhance_1 import EPWALogitsProcessor, EPWADetectionSuite
@@ -63,6 +65,35 @@ output = model.generate(
 detection_suite = EPWADetectionSuite(tokenizer, model, secret_key)
 result = detection_suite.detect_graybox_cspv(text, sample_size=30)
 ```
+
+### 快速加载配置
+
+为了优化模型加载速度，支持多种量化选项：
+
+```bash
+# 4位量化（最快，精度损失较大）
+export EPW_LOAD_IN_4BIT=true
+python epw-enhance-1.py
+
+# 8位量化（较快，精度损失较小）
+export EPW_LOAD_IN_8BIT=true
+python epw-enhance-1.py
+
+# 快速加载模式（默认4位量化）
+export EPW_FAST_LOADING=true
+python epw-enhance-1.py
+
+# CPU模式（避免GPU内存分配）
+export EPW_USE_CPU=true
+python epw-enhance-1.py
+
+# 组合使用
+export EPW_LOAD_IN_4BIT=true
+export EPW_USE_CPU=true
+python epw-enhance-1.py
+```
+
+**量化优先级**：`EPW_LOAD_IN_4BIT` > `EPW_LOAD_IN_8BIT` > 快速加载默认4位 > 标准加载默认4位
 
 ## 📊 性能对比
 
@@ -101,6 +132,20 @@ python epw-enhance-1.py
 # - CSPV灰盒检测
 # - PEPI黑盒检测
 # - 性能对比分析
+
+# 测试不同加载配置的性能
+python test_loading_speed.py
+
+# 这将测试：
+# - 标准配置
+# - 快速加载模式
+# - 4位量化
+# - 8位量化
+# - CPU模式
+# - 各种组合配置
+
+# 4位量化使用示例
+python example_4bit_usage.py
 ```
 
 ## 🤝 贡献
