@@ -1,8 +1,19 @@
-# epw.py
-# Implementation of Expert Pathway Watermarking (EPW) for Mixture-of-Experts (MoE) LLMs
-# FINAL ARCHITECTURE: This version uses the robust model subclassing approach to
-# resolve timing issues and correctly handles all discovered bugs.
-# ENHANCED WITH EPW-A: Implements the enhanced EPW-A framework with IRSH protocol
+"""
+EPW-A Framework (Enhanced Architecture for Expert Pathway Watermarking)
+Enhanced implementation with improved model loading and watermarking capabilities.
+
+快速加载优化说明：
+1. 设置环境变量 EPW_FAST_LOADING=true 启用快速加载模式
+2. 设置环境变量 EPW_LOAD_IN_8BIT=true 使用8位量化（更快但精度稍低）
+3. 设置环境变量 EPW_USE_CPU=true 强制使用CPU加载（避免GPU内存分配时间）
+4. 设置环境变量 EPW_MODEL_PATH 指定模型路径
+
+加载时间优化建议：
+- 使用SSD存储模型文件
+- 确保有足够的RAM（至少16GB）
+- 使用GPU时确保显存充足
+- 考虑使用更小的模型进行测试
+"""
 
 import torch
 import hashlib
@@ -16,6 +27,16 @@ from transformers.generation.utils import CausalLMOutputWithPast
 import transformers.models.mixtral.modeling_mixtral as modeling_mixtral
 import importlib.metadata
 import warnings
+import os
+
+# 检查bitsandbytes是否可用
+try:
+    import bitsandbytes
+    bitsandbytes_installed = True
+except ImportError:
+    bitsandbytes_installed = False
+    print("Warning: bitsandbytes not installed. Quantization will be disabled.")
+
 
 # Try to import numpy and scikit-learn for PEPI oracle
 try:
@@ -804,10 +825,21 @@ if __name__ == '__main__':
     
     # 支持多种模型路径配置
     import os
-    
+
     # 尝试从环境变量获取模型路径
     model_name = os.getenv('EPW_MODEL_PATH', None)
-    
+
+    # 快速加载配置
+    FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'false').lower() == 'true'
+    LOAD_IN_8BIT = os.getenv('EPW_LOAD_IN_8BIT', 'false').lower() == 'true'
+    USE_CPU = os.getenv('EPW_USE_CPU', 'false').lower() == 'true'
+
+    if FAST_LOADING:
+        print("启用快速加载模式...")
+        print("提示：设置 EPW_FAST_LOADING=true 来启用快速加载")
+        print("提示：设置 EPW_LOAD_IN_8BIT=true 来使用8位量化")
+        print("提示：设置 EPW_USE_CPU=true 来强制使用CPU加载")
+
     # 如果没有设置环境变量，尝试一些常见的模型路径
     if model_name is None:
         possible_paths = [
@@ -828,43 +860,90 @@ if __name__ == '__main__':
     
     print(f"Using model: {model_name}")
 
+    # 添加加载时间监控
+    import time
+    start_time = time.time()
+
     try:
         # 加载tokenizer
+        print("Loading tokenizer...")
+        tokenizer_start = time.time()
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer_time = time.time() - tokenizer_start
+        print(f"Tokenizer loaded in {tokenizer_time:.2f} seconds")
 
         # 配置量化
         quantization_config = None
-        device_map = "auto"  # 使用自动设备映射
         
-        if bitsandbytes_installed and "mixtral" in model_name.lower():
-            print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
-            try:
-                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-            except Exception as e:
-                print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
-                quantization_config = None
+        # 根据快速加载配置选择设备映射
+        if USE_CPU:
+            device_map = "cpu"
+            print("使用CPU加载模式")
+        else:
+            device_map = "auto"  # 使用自动设备映射
+        
+        # 根据快速加载配置选择量化策略
+        if FAST_LOADING:
+            if LOAD_IN_8BIT and bitsandbytes_installed:
+                print("使用8位量化进行快速加载...")
+                try:
+                    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                except Exception as e:
+                    print(f"Warning: 8-bit quantization failed: {e}. Using 4-bit quantization.")
+                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            elif bitsandbytes_installed and "mixtral" in model_name.lower():
+                print("使用4位量化进行快速加载...")
+                try:
+                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                except Exception as e:
+                    print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
+                    quantization_config = None
+        else:
+            # 标准加载模式
+            if bitsandbytes_installed and "mixtral" in model_name.lower():
+                print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
+                try:
+                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                except Exception as e:
+                    print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
+                    quantization_config = None
         
         # 尝试加载模型
         print("Loading model...")
+        model_start = time.time()
         model = MixtralForCausalLMWithWatermark.from_pretrained(
             model_name,
             torch_dtype=torch.float16,  # 使用float16而不是bfloat16以提高兼容性
             device_map=device_map,
             quantization_config=quantization_config,
             trust_remote_code=True,  # 添加信任远程代码选项
+            low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
         )
         model.eval()
+        model_time = time.time() - model_start
+        print(f"Model loaded in {model_time:.2f} seconds")
         
         # 确保模型完全加载后再计算router hash
-        print("Model loaded successfully. Calculating router hash...")
+        print("Calculating router hash...")
+        hash_start = time.time()
         try:
             router_hash = model.router_hash
             print(f"Router Hash (IRSH): {router_hash}")
         except Exception as e:
             print(f"Warning: Could not calculate router hash after loading: {e}")
             print("Using fallback hash for IRSH protocol.")
+        hash_time = time.time() - hash_start
+        print(f"Router hash calculated in {hash_time:.2f} seconds")
+        
+        total_time = time.time() - start_time
+        print(f"\n=== 加载时间统计 ===")
+        print(f"Tokenizer: {tokenizer_time:.2f}秒")
+        print(f"Model: {model_time:.2f}秒")
+        print(f"Router Hash: {hash_time:.2f}秒")
+        print(f"总加载时间: {total_time:.2f}秒")
+        print(f"==================\n")
         
     except Exception as e:
         print(f"\nError loading model with primary configuration: {e}")
