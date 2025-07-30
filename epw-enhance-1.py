@@ -873,12 +873,15 @@ if __name__ == '__main__':
         
         # 根据量化配置选择量化策略
         if LOAD_IN_4BIT and bitsandbytes_installed:
-            print("使用4位量化...")
-            try:
-                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-            except Exception as e:
-                print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
-                quantization_config = None
+                   print("使用4位量化...")
+                   try:
+                       quantization_config = BitsAndBytesConfig(
+                           load_in_4bit=True,
+                           bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                       )
+                   except Exception as e:
+                       print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
+                       quantization_config = None
         elif LOAD_IN_8BIT and bitsandbytes_installed:
             print("使用8位量化...")
             try:
@@ -891,7 +894,10 @@ if __name__ == '__main__':
             if bitsandbytes_installed and "mixtral" in model_name.lower():
                 print("快速加载模式：使用4位量化...")
                 try:
-                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                    )
                 except Exception as e:
                     print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
                     quantization_config = None
@@ -900,7 +906,10 @@ if __name__ == '__main__':
             if bitsandbytes_installed and "mixtral" in model_name.lower():
                 print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
                 try:
-                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                    )
                 except Exception as e:
                     print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
                     quantization_config = None
