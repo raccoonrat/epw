@@ -60,14 +60,18 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
 
     def __init__(self, config):
         super().__init__(config)
-        # Calculate router hash for IRSH protocol
-        self.router_hash = self._calculate_router_hash()
+        # Initialize router_hash as None, will be calculated when needed
+        self._router_hash = None
         
     def _calculate_router_hash(self) -> str:
         """
         Calculate the cryptographic hash of router weights for IRSH protocol.
         This binds the watermark to a specific version of the router.
         """
+        # If already calculated, return cached value
+        if self._router_hash is not None:
+            return self._router_hash
+            
         router_weights = []
         
         try:
@@ -76,23 +80,46 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
                 if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
                     # Get the gate weights (router weights)
                     gate_weights = layer.block_sparse_moe.gate.weight.data
-                    router_weights.append(gate_weights.cpu().numpy().tobytes())
+                    
+                    # Check if the tensor is a meta tensor (no data)
+                    if hasattr(gate_weights, 'is_meta') and gate_weights.is_meta:
+                        print("Warning: Router weights are meta tensors. Using fallback hash.")
+                        raise RuntimeError("Meta tensor detected")
+                    
+                    # Try to access the data safely
+                    try:
+                        weight_bytes = gate_weights.cpu().numpy().tobytes()
+                        router_weights.append(weight_bytes)
+                    except Exception as e:
+                        print(f"Warning: Could not access router weight data: {e}")
+                        raise RuntimeError(f"Cannot access router weight data: {e}")
             
             # Concatenate all router weights and hash
             if router_weights:
                 combined_weights = b''.join(router_weights)
                 router_hash = hashlib.sha256(combined_weights).hexdigest()
+                self._router_hash = router_hash
                 return router_hash
             else:
                 # Fallback for non-MoE models: use model name and config
                 fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
-                return hashlib.sha256(fallback_data).hexdigest()
+                self._router_hash = hashlib.sha256(fallback_data).hexdigest()
+                return self._router_hash
                 
         except Exception as e:
             print(f"Warning: Could not calculate router hash: {e}")
             # Fallback: use model name as hash
             fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
-            return hashlib.sha256(fallback_data).hexdigest()
+            self._router_hash = hashlib.sha256(fallback_data).hexdigest()
+            return self._router_hash
+    
+    @property
+    def router_hash(self) -> str:
+        """
+        Property to get router hash, calculating it on first access.
+        This ensures the model is fully loaded before attempting to access weights.
+        """
+        return self._calculate_router_hash()
 
     def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]):
         """
@@ -830,8 +857,14 @@ if __name__ == '__main__':
         )
         model.eval()
         
-        # Print router hash for IRSH protocol
-        print(f"Router Hash (IRSH): {model.router_hash}")
+        # 确保模型完全加载后再计算router hash
+        print("Model loaded successfully. Calculating router hash...")
+        try:
+            router_hash = model.router_hash
+            print(f"Router Hash (IRSH): {router_hash}")
+        except Exception as e:
+            print(f"Warning: Could not calculate router hash after loading: {e}")
+            print("Using fallback hash for IRSH protocol.")
         
     except Exception as e:
         print(f"\nError loading model with primary configuration: {e}")
@@ -847,7 +880,14 @@ if __name__ == '__main__':
             )
             model.eval()
             print("Model loaded successfully with fallback configuration.")
-            print(f"Router Hash (IRSH): {model.router_hash}")
+            
+            # 确保模型完全加载后再计算router hash
+            try:
+                router_hash = model.router_hash
+                print(f"Router Hash (IRSH): {router_hash}")
+            except Exception as e:
+                print(f"Warning: Could not calculate router hash after loading: {e}")
+                print("Using fallback hash for IRSH protocol.")
             
         except Exception as e2:
             print(f"\nFallback configuration also failed: {e2}")
