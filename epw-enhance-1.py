@@ -282,37 +282,30 @@ class EPWALogitsProcessor(LogitsProcessor):
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.FloatTensor:
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
         EPW-A implementation: Apply watermark based on expert routing with IRSH protocol.
+        Note: Currently using fallback mode since expert routing info is not available
+        in the standard LogitsProcessor interface.
         """
-        # Safely get the router_logits from the kwargs
-        router_logits = kwargs.get("router_logits")
-
-        if router_logits is None:
-            # For non-MoE models, use a simple fallback approach
-            # Use the last token's position as a simple "expert index"
-            expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
-        else:
-            # The router_logits is a tuple of tensors (one per MoE layer). We use the last layer's
-            last_layer_router_logits = router_logits[-1]
-            
-            # Get expert index and probabilities
-            expert_probabilities = torch.softmax(last_layer_router_logits, dim=-1)
-            expert_index = torch.argmax(last_layer_router_logits, dim=-1).item()
-
+        # Fallback approach: Use the last token's position as a simple "expert index"
+        # This is a temporary solution until we can properly integrate expert routing
+        expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
+        
         # Generate green list using IRSH protocol
         green_list_ids = self._get_green_list_ids(expert_index).to(scores.device)
         
-        # Calculate effective delta based on mode and routing confidence
-        if router_logits is not None:
-            effective_delta = self._calculate_effective_delta(expert_index, expert_probabilities)
-        else:
-            # Fallback delta for non-MoE models
-            effective_delta = float(self.delta_config) if isinstance(self.delta_config, (int, float)) else 4.0
+        # Use fallback delta for now
+        effective_delta = float(self.delta_config) if isinstance(self.delta_config, (int, float)) else 4.0
         
         # Apply watermark bias
         scores[:, green_list_ids] += effective_delta
+        
+        # Print confirmation of fallback mode (only once)
+        if not hasattr(self, '_fallback_printed'):
+            print(f"EPW-A LogitsProcessor: Using fallback mode with expert_index={expert_index}")
+            self._fallback_printed = True
+            
         return scores
 
 # =======================================================================================
@@ -341,26 +334,15 @@ class WatermarkLogitsProcessor(LogitsProcessor):
         permutation = torch.randperm(self.vocab_size, generator=generator)
         return permutation[:self.green_list_size]
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.FloatTensor:
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
-        CORRECT IMPLEMENTATION: This method is called by the generate function.
-        Thanks to our model subclass, the `kwargs` dictionary now reliably
-        contains the synchronized `router_logits`.
+        Legacy LogitsProcessor implementation.
+        Note: Currently using fallback mode since expert routing info is not available
+        in the standard LogitsProcessor interface.
         """
-        # Safely get the router_logits from the kwargs.
-        router_logits = kwargs.get("router_logits")
-
-        if router_logits is None:
-            # If for any reason the logits are not available, do not apply the watermark.
-            return scores
-
-        # The router_logits is a tuple of tensors (one per MoE layer). We use the last layer's.
-        # The tensor shape is (batch_size, num_experts).
-        last_layer_router_logits = router_logits[-1]
-
-        # In the generate loop, the batch size is 1. We get the single expert index.
-        expert_index = torch.argmax(last_layer_router_logits, dim=-1).item()
-
+        # Fallback approach: Use the last token's position as a simple "expert index"
+        expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
+        
         # Generate the green list and apply the bias.
         green_list_ids = self._get_green_list_ids(expert_index).to(scores.device)
         scores[:, green_list_ids] += self.delta
