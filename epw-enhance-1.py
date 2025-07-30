@@ -498,8 +498,8 @@ def main():
     # 确定模型路径
     possible_paths = [
         EPW_MODEL_PATH,
-        "deepseek-ai/deepseek-moe-16b-chat",
-        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "/root/private_data/model/DeepSeek-MoE",
+        "/root/private_data/model/mixtral-8x7b",
         "microsoft/DialoGPT-medium"
     ]
     
