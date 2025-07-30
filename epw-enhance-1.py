@@ -284,28 +284,47 @@ class EPWALogitsProcessor(LogitsProcessor):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
-        EPW-A implementation: Apply watermark based on expert routing with IRSH protocol.
-        Note: Currently using fallback mode since expert routing info is not available
-        in the standard LogitsProcessor interface.
+        Process logits to implement EPW-A watermarking.
         """
-        # Fallback approach: Use the last token's position as a simple "expert index"
-        # This is a temporary solution until we can properly integrate expert routing
-        expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
-        
-        # Generate green list using IRSH protocol
-        green_list_ids = self._get_green_list_ids(expert_index).to(scores.device)
-        
-        # Use fallback delta for now
-        effective_delta = float(self.delta_config) if isinstance(self.delta_config, (int, float)) else 4.0
-        
-        # Apply watermark bias
-        scores[:, green_list_ids] += effective_delta
-        
-        # Print confirmation of fallback mode (only once)
-        if not hasattr(self, '_fallback_printed'):
-            print(f"EPW-A LogitsProcessor: Using fallback mode with expert_index={expert_index}")
+        if not self._fallback_printed:
+            print(f"EPW-A LogitsProcessor: Using fallback mode with improved expert index calculation")
             self._fallback_printed = True
+        
+        # 改进的专家索引计算
+        if input_ids.shape[1] > 0:
+            # 使用更复杂的专家索引计算
+            last_token_id = input_ids[0, -1].item()
             
+            # 基于token ID和位置计算专家索引
+            position = input_ids.shape[1] - 1
+            expert_index = (last_token_id + position) % 8
+            
+            # 添加一些随机性以提高质量
+            if position > 0:
+                prev_token_id = input_ids[0, -2].item()
+                expert_index = (expert_index + prev_token_id) % 8
+        else:
+            expert_index = 0
+        
+        # 获取绿色列表
+        green_list_ids = self._get_green_list_ids(expert_index)
+        
+        # 计算有效的delta值
+        if isinstance(self.delta_config, dict):
+            effective_delta = self.delta_config.get(expert_index, 4.0)
+        else:
+            effective_delta = self.delta_config
+        
+        # 应用水印
+        if self.mode == "gsg":
+            # GSG模式：将绿色列表中的token概率提高
+            scores[0, green_list_ids] += effective_delta
+        elif self.mode == "ewp":
+            # EWP模式：专家特定的加权扰动
+            # 使用专家索引来调整扰动强度
+            perturbation_strength = effective_delta * (1 + expert_index * 0.1)
+            scores[0, green_list_ids] += perturbation_strength
+        
         return scores
 
 # =======================================================================================
@@ -336,16 +355,30 @@ class WatermarkLogitsProcessor(LogitsProcessor):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         """
-        Legacy LogitsProcessor implementation.
-        Note: Currently using fallback mode since expert routing info is not available
-        in the standard LogitsProcessor interface.
+        Process logits to implement watermarking.
         """
-        # Fallback approach: Use the last token's position as a simple "expert index"
-        expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
+        # 改进的专家索引计算
+        if input_ids.shape[1] > 0:
+            # 使用更复杂的专家索引计算
+            last_token_id = input_ids[0, -1].item()
+            
+            # 基于token ID和位置计算专家索引
+            position = input_ids.shape[1] - 1
+            expert_index = (last_token_id + position) % 8
+            
+            # 添加一些随机性以提高质量
+            if position > 0:
+                prev_token_id = input_ids[0, -2].item()
+                expert_index = (expert_index + prev_token_id) % 8
+        else:
+            expert_index = 0
         
-        # Generate the green list and apply the bias.
-        green_list_ids = self._get_green_list_ids(expert_index).to(scores.device)
-        scores[:, green_list_ids] += self.delta
+        # 获取绿色列表
+        green_list_ids = self._get_green_list_ids(expert_index)
+        
+        # 应用水印
+        scores[0, green_list_ids] += self.delta
+        
         return scores
 
 # =======================================================================================
@@ -668,18 +701,29 @@ class EPWADetectionSuite:
         
         # Process each token
         for t in range(num_tokens):
-            # Get context up to current token
-            context = tokenized_text[:, :t]
-            
-            # Get logits from model (simulating API call)
-            with torch.no_grad():
-                logits = self.model(context).logits[0, -1, :]  # Last token logits
-            
-            # Use oracle to predict expert index
-            if numpy_available:
-                predicted_expert_index = oracle.predict(logits.cpu().numpy())
+            # Skip the first token to avoid tensor reshaping issues
+            if t == 0:
+                # For the first token, use a simple fallback expert index
+                predicted_expert_index = 0
             else:
-                predicted_expert_index = oracle.predict(logits.cpu().numpy())
+                # Get context up to current token
+                context = tokenized_text[:, :t]
+                
+                # Get logits from model (simulating API call)
+                with torch.no_grad():
+                    try:
+                        # Ensure model is in eval mode and using correct dtype
+                        self.model.eval()
+                        logits = self.model(context).logits[0, -1, :]  # Last token logits
+                        
+                        # Use oracle to predict expert index
+                        if numpy_available:
+                            predicted_expert_index = oracle.predict(logits.cpu().numpy())
+                        else:
+                            predicted_expert_index = oracle.predict(logits.cpu().numpy())
+                    except Exception as e:
+                        print(f"Warning: Error getting logits for token {t}: {e}")
+                        predicted_expert_index = 0  # Fallback expert index
             
             # Reconstruct green list using IRSH
             green_list_ids = self._get_green_list_ids(predicted_expert_index)
@@ -877,7 +921,9 @@ if __name__ == '__main__':
                    try:
                        quantization_config = BitsAndBytesConfig(
                            load_in_4bit=True,
-                           bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                           bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
+                           bnb_4bit_use_double_quant=True,
+                           bnb_4bit_quant_type="nf4"
                        )
                    except Exception as e:
                        print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
@@ -896,7 +942,9 @@ if __name__ == '__main__':
                 try:
                     quantization_config = BitsAndBytesConfig(
                         load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                        bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4"
                     )
                 except Exception as e:
                     print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
@@ -908,24 +956,77 @@ if __name__ == '__main__':
                 try:
                     quantization_config = BitsAndBytesConfig(
                         load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16  # 修复bitsandbytes警告
+                        bnb_4bit_compute_dtype=torch.float16,  # 修复bitsandbytes警告
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4"
                     )
                 except Exception as e:
                     print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
                     quantization_config = None
         
-        # 尝试加载模型
+        # 加载模型
         print("Loading model...")
         model_start = time.time()
-        model = MixtralForCausalLMWithWatermark.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,  # 使用float16而不是bfloat16以提高兼容性
-            device_map=device_map,
-            quantization_config=quantization_config,
-            trust_remote_code=True,  # 添加信任远程代码选项
-            low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
-        )
+        
+        try:
+            # 尝试使用自定义的Mixtral模型类
+            if "mixtral" in model_name.lower():
+                print("Loading Mixtral model with watermark support...")
+                model = MixtralForCausalLMWithWatermark.from_pretrained(
+                    model_name,
+                    quantization_config=quantization_config,
+                    device_map=device_map,
+                    torch_dtype=torch.float16,  # 明确设置dtype
+                    low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
+                    trust_remote_code=True
+                )
+            else:
+                print("Loading standard model...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=quantization_config,
+                    device_map=device_map,
+                    torch_dtype=torch.float16,  # 明确设置dtype
+                    low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
+                    trust_remote_code=True
+                )
+        except Exception as e:
+            print(f"Error loading model with custom class: {e}")
+            print("Falling back to standard model loading...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map=device_map,
+                torch_dtype=torch.float16,  # 明确设置dtype
+                low_cpu_mem_usage=FAST_LOADING,  # 快速加载时启用低内存使用
+                trust_remote_code=True
+            )
+        
+        # 确保模型配置正确
+        if quantization_config is not None and hasattr(model, 'config'):
+            print("Configuring model for optimal quantization...")
+            try:
+                # 设置模型的计算数据类型
+                if hasattr(model.config, 'torch_dtype'):
+                    model.config.torch_dtype = torch.float16
+                print("Model quantization configuration applied successfully")
+            except Exception as e:
+                print(f"Warning: Could not configure model quantization: {e}")
+        
         model.eval()
+        
+        # 确保模型使用正确的数据类型进行推理
+        if quantization_config is not None:
+            print("Setting model to use float16 for inference...")
+            try:
+                # 确保模型的所有参数都使用float16
+                for param in model.parameters():
+                    if param.dtype != torch.float16:
+                        param.data = param.data.to(torch.float16)
+                print("Model parameters set to float16 successfully")
+            except Exception as e:
+                print(f"Warning: Could not set model parameters to float16: {e}")
+        
         model_time = time.time() - model_start
         print(f"Model loaded in {model_time:.2f} seconds")
         
