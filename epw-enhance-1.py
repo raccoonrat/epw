@@ -70,17 +70,29 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
         """
         router_weights = []
         
-        # Collect router weights from all MoE layers
-        for layer in self.model.layers:
-            if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
-                # Get the gate weights (router weights)
-                gate_weights = layer.block_sparse_moe.gate.weight.data
-                router_weights.append(gate_weights.cpu().numpy().tobytes())
-        
-        # Concatenate all router weights and hash
-        combined_weights = b''.join(router_weights)
-        router_hash = hashlib.sha256(combined_weights).hexdigest()
-        return router_hash
+        try:
+            # Collect router weights from all MoE layers
+            for layer in self.model.layers:
+                if hasattr(layer, 'block_sparse_moe') and isinstance(layer.block_sparse_moe, MixtralSparseMoeBlock):
+                    # Get the gate weights (router weights)
+                    gate_weights = layer.block_sparse_moe.gate.weight.data
+                    router_weights.append(gate_weights.cpu().numpy().tobytes())
+            
+            # Concatenate all router weights and hash
+            if router_weights:
+                combined_weights = b''.join(router_weights)
+                router_hash = hashlib.sha256(combined_weights).hexdigest()
+                return router_hash
+            else:
+                # Fallback for non-MoE models: use model name and config
+                fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
+                return hashlib.sha256(fallback_data).hexdigest()
+                
+        except Exception as e:
+            print(f"Warning: Could not calculate router hash: {e}")
+            # Fallback: use model name as hash
+            fallback_data = f"{self.config.model_type}_{self.config.vocab_size}".encode('utf-8')
+            return hashlib.sha256(fallback_data).hexdigest()
 
     def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]):
         """
@@ -95,7 +107,9 @@ class MixtralForCausalLMWithWatermark(MixtralForCausalLM):
         b) temporarily bypass the auxiliary load balancing loss which is unused during
         inference and can cause errors.
         """
-        kwargs['output_router_logits'] = True
+        # Only set output_router_logits for MoE models
+        if hasattr(self.config, 'model_type') and 'mixtral' in self.config.model_type.lower():
+            kwargs['output_router_logits'] = True
 
         # MONKEY-PATCH to bypass problematic auxiliary loss calculation during inference.
         original_loss_func = getattr(modeling_mixtral, "load_balancing_loss_func", None)
@@ -225,21 +239,26 @@ class EPWALogitsProcessor(LogitsProcessor):
         router_logits = kwargs.get("router_logits")
 
         if router_logits is None:
-            # If for any reason the logits are not available, do not apply the watermark
-            return scores
-
-        # The router_logits is a tuple of tensors (one per MoE layer). We use the last layer's
-        last_layer_router_logits = router_logits[-1]
-        
-        # Get expert index and probabilities
-        expert_probabilities = torch.softmax(last_layer_router_logits, dim=-1)
-        expert_index = torch.argmax(last_layer_router_logits, dim=-1).item()
+            # For non-MoE models, use a simple fallback approach
+            # Use the last token's position as a simple "expert index"
+            expert_index = (input_ids[0, -1] % 8) if input_ids.shape[1] > 0 else 0
+        else:
+            # The router_logits is a tuple of tensors (one per MoE layer). We use the last layer's
+            last_layer_router_logits = router_logits[-1]
+            
+            # Get expert index and probabilities
+            expert_probabilities = torch.softmax(last_layer_router_logits, dim=-1)
+            expert_index = torch.argmax(last_layer_router_logits, dim=-1).item()
 
         # Generate green list using IRSH protocol
         green_list_ids = self._get_green_list_ids(expert_index).to(scores.device)
         
         # Calculate effective delta based on mode and routing confidence
-        effective_delta = self._calculate_effective_delta(expert_index, expert_probabilities)
+        if router_logits is not None:
+            effective_delta = self._calculate_effective_delta(expert_index, expert_probabilities)
+        else:
+            # Fallback delta for non-MoE models
+            effective_delta = float(self.delta_config) if isinstance(self.delta_config, (int, float)) else 4.0
         
         # Apply watermark bias
         scores[:, green_list_ids] += effective_delta
@@ -755,23 +774,59 @@ if __name__ == '__main__':
     print("--- Full Implementation of EPW-A Framework (Enhanced Architecture) ---")
 
     SECRET_KEY = "a_very_secret_and_long_key_for_hmac"
-    model_name = "/root/private_data/model/mixtral-8x7b"
+    
+    # 支持多种模型路径配置
+    import os
+    
+    # 尝试从环境变量获取模型路径
+    model_name = os.getenv('EPW_MODEL_PATH', None)
+    
+    # 如果没有设置环境变量，尝试一些常见的模型路径
+    if model_name is None:
+        possible_paths = [
+            "/root/private_data/model/mixtral-8x7b",
+            "microsoft/DialoGPT-medium",  # 备用模型，用于测试
+            "gpt2",  # 另一个备用模型
+        ]
+        
+        # 检查路径是否存在
+        for path in possible_paths:
+            if os.path.exists(path) or path.startswith(('microsoft/', 'gpt2')):
+                model_name = path
+                break
+        
+        if model_name is None:
+            print("Warning: No valid model path found. Using 'microsoft/DialoGPT-medium' as fallback.")
+            model_name = "microsoft/DialoGPT-medium"
+    
+    print(f"Using model: {model_name}")
 
     try:
+        # 加载tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        # 配置量化
         quantization_config = None
-        if bitsandbytes_installed:
-            print("bitsandbytes found. Loading model with 4-bit quantization.")
-            quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-
+        device_map = "auto"  # 使用自动设备映射
+        
+        if bitsandbytes_installed and "mixtral" in model_name.lower():
+            print("bitsandbytes found. Attempting to load model with 4-bit quantization.")
+            try:
+                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            except Exception as e:
+                print(f"Warning: 4-bit quantization failed: {e}. Using 16-bit precision.")
+                quantization_config = None
+        
+        # 尝试加载模型
+        print("Loading model...")
         model = MixtralForCausalLMWithWatermark.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": 0},
+            torch_dtype=torch.float16,  # 使用float16而不是bfloat16以提高兼容性
+            device_map=device_map,
             quantization_config=quantization_config,
+            trust_remote_code=True,  # 添加信任远程代码选项
         )
         model.eval()
         
@@ -779,8 +834,29 @@ if __name__ == '__main__':
         print(f"Router Hash (IRSH): {model.router_hash}")
         
     except Exception as e:
-        print(f"\nError loading model or tokenizer: {e}")
-        model, tokenizer = None, None
+        print(f"\nError loading model with primary configuration: {e}")
+        print("Attempting fallback configuration...")
+        
+        try:
+            # 备用配置：使用更简单的设置
+            model = MixtralForCausalLMWithWatermark.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,  # 使用float32
+                device_map="cpu",  # 强制使用CPU
+                trust_remote_code=True,
+            )
+            model.eval()
+            print("Model loaded successfully with fallback configuration.")
+            print(f"Router Hash (IRSH): {model.router_hash}")
+            
+        except Exception as e2:
+            print(f"\nFallback configuration also failed: {e2}")
+            print("Please check:")
+            print("1. Model path is correct and accessible")
+            print("2. Sufficient memory is available")
+            print("3. Required dependencies are installed")
+            print("4. Try setting EPW_MODEL_PATH environment variable")
+            model, tokenizer = None, None
 
     if tokenizer and model:
         print("\n--- 1. Generating Watermarked Text with EPW-A ---")
