@@ -8,20 +8,19 @@ from transformers import LogitsProcessor
 token = "hf_XXX"
 
 # 使用一个公开的MoE模型，并以4位量化加载以节省资源
-model_id = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+model_id = "/root/private_data/model/mixtral-8x7b"
 #model_id = "/work/home/scnttrxbp8/wangyh/Mixtral-8x7B-Instruct-v0.1"
 
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True
 )
 
-tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
     device_map="auto",
     quantization_config=quantization_config,
-    token=token,
 )
 
 # 获取词汇表大小，用于后续的绿/红名单划分
@@ -140,7 +139,7 @@ def generate_with_gsg_watermark(prompt, model, tokenizer, max_new_tokens=100, ga
         # 2. 提取顶级专家索引作为水印种子
         # 我们使用最后一个MoE层的最后一个token的路由决策
         # Mixtral的MoE层在奇数层，我们取最后一层(31)
-         last_layer_router_logits = outputs.router_logits[-1]
+        last_layer_router_logits = outputs.router_logits[-1]
 
         if last_layer_router_logits.dim() == 3:
             # Case: [batch_size, sequence_length, num_experts]

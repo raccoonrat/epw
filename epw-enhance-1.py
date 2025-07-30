@@ -755,14 +755,10 @@ if __name__ == '__main__':
     print("--- Full Implementation of EPW-A Framework (Enhanced Architecture) ---")
 
     SECRET_KEY = "a_very_secret_and_long_key_for_hmac"
-    model_name = "mistralai/Mixtral-8x7B-v0.1"
-    token = "hf_xxx"  # Replace with your token
-
-    if token == "hf_xxx":
-        print("WARNING: Please replace 'hf_xxx' with your Hugging Face token.")
+    model_name = "/root/private_data/model/mixtral-8x7b"
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -774,9 +770,8 @@ if __name__ == '__main__':
         model = MixtralForCausalLMWithWatermark.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": 0},
             quantization_config=quantization_config,
-            token=token,
         )
         model.eval()
         
