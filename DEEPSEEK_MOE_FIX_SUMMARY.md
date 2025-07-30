@@ -43,15 +43,31 @@ class MoEModelWithWatermark:
 ### 2. DynamicCache兼容性修复
 
 ```python
-# 修复DynamicCache兼容性问题
-try:
-    from transformers.cache import DynamicCache
-    if not hasattr(DynamicCache, 'get_usable_length'):
-        def get_usable_length(self):
-            return self.get_seq_length()
-        DynamicCache.get_usable_length = get_usable_length
-except ImportError:
-    pass
+def fix_dynamic_cache_compatibility():
+    """修复DynamicCache兼容性问题"""
+    try:
+        # 尝试导入DynamicCache
+        from transformers.cache import DynamicCache
+        
+        # 检查是否需要添加get_usable_length方法
+        if not hasattr(DynamicCache, 'get_usable_length'):
+            def get_usable_length(self):
+                """兼容性方法，返回序列长度"""
+                return self.get_seq_length()
+            
+            # 动态添加方法
+            DynamicCache.get_usable_length = get_usable_length
+            print("✓ DynamicCache兼容性修复已应用")
+        else:
+            print("✓ DynamicCache已包含get_usable_length方法")
+            
+    except ImportError:
+        print("⚠️ 无法导入DynamicCache，跳过兼容性修复")
+    except Exception as e:
+        print(f"⚠️ DynamicCache修复失败: {e}")
+
+# 在导入其他模块之前应用修复
+fix_dynamic_cache_compatibility()
 ```
 
 ### 3. 设备映射修复
@@ -166,9 +182,11 @@ inputs = {k: v.to(model_device) for k, v in inputs.items()}
 
 创建了多个测试脚本来验证修复：
 
-1. **`simple_test.py`**: 简单的文本生成测试，验证DynamicCache修复
-2. **`test_deepseek_moe_fix.py`**: 完整的模型加载和功能测试
-3. **主程序测试**: 完整的水印功能测试
+1. **`dynamic_cache_fix.py`**: 独立的DynamicCache修复脚本
+2. **`test_dynamic_cache_fix.py`**: 测试DynamicCache修复的脚本
+3. **`simple_test.py`**: 简单的文本生成测试
+4. **`test_deepseek_moe_fix.py`**: 完整的模型加载和功能测试
+5. **主程序测试**: 完整的水印功能测试
 
 ## 环境变量配置
 
@@ -189,6 +207,9 @@ export EPW_MODEL_PATH="deepseek-ai/deepseek-moe-16b-chat"
 ## 使用示例
 
 ```python
+# 运行DynamicCache修复
+python dynamic_cache_fix.py
+
 # 运行简单测试
 python simple_test.py
 
@@ -206,6 +227,30 @@ python epw-enhance-1.py
 3. ✅ **设备映射问题**: 通过自动设备检测和移动解决
 4. ✅ **专家数量检测**: 支持动态检测不同模型的专家数量
 5. ✅ **MoE架构兼容**: 支持不同的MoE块结构
+
+## 故障排除
+
+如果仍然遇到DynamicCache错误，可以尝试：
+
+1. **运行独立的修复脚本**:
+   ```bash
+   python dynamic_cache_fix.py
+   ```
+
+2. **检查transformers版本**:
+   ```bash
+   pip show transformers
+   ```
+
+3. **重新安装transformers**:
+   ```bash
+   pip install --upgrade transformers
+   ```
+
+4. **使用不同的transformers版本**:
+   ```bash
+   pip install transformers==4.35.0
+   ```
 
 ## 总结
 

@@ -30,15 +30,32 @@ from transformers import (
 import warnings
 import time
 
-# 修复DynamicCache兼容性问题
-try:
-    from transformers.cache import DynamicCache
-    if not hasattr(DynamicCache, 'get_usable_length'):
-        def get_usable_length(self):
-            return self.get_seq_length()
-        DynamicCache.get_usable_length = get_usable_length
-except ImportError:
-    pass
+# 修复DynamicCache兼容性问题 - 更强大的修复方案
+def fix_dynamic_cache_compatibility():
+    """修复DynamicCache兼容性问题"""
+    try:
+        # 尝试导入DynamicCache
+        from transformers.cache import DynamicCache
+        
+        # 检查是否需要添加get_usable_length方法
+        if not hasattr(DynamicCache, 'get_usable_length'):
+            def get_usable_length(self):
+                """兼容性方法，返回序列长度"""
+                return self.get_seq_length()
+            
+            # 动态添加方法
+            DynamicCache.get_usable_length = get_usable_length
+            print("✓ DynamicCache兼容性修复已应用")
+        else:
+            print("✓ DynamicCache已包含get_usable_length方法")
+            
+    except ImportError:
+        print("⚠️ 无法导入DynamicCache，跳过兼容性修复")
+    except Exception as e:
+        print(f"⚠️ DynamicCache修复失败: {e}")
+
+# 在导入其他模块之前应用修复
+fix_dynamic_cache_compatibility()
 
 # 设置环境变量
 EPW_FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'true').lower() == 'true'
