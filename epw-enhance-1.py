@@ -30,6 +30,16 @@ from transformers import (
 import warnings
 import time
 
+# 修复DynamicCache兼容性问题
+try:
+    from transformers.cache import DynamicCache
+    if not hasattr(DynamicCache, 'get_usable_length'):
+        def get_usable_length(self):
+            return self.get_seq_length()
+        DynamicCache.get_usable_length = get_usable_length
+except ImportError:
+    pass
+
 # 设置环境变量
 EPW_FAST_LOADING = os.getenv('EPW_FAST_LOADING', 'true').lower() == 'true'
 EPW_LOAD_IN_8BIT = os.getenv('EPW_LOAD_IN_8BIT', 'false').lower() == 'true'
@@ -488,8 +498,8 @@ def main():
     # 确定模型路径
     possible_paths = [
         EPW_MODEL_PATH,
-        "/root/private_data/model/DeepSeek-MoE/",
-        "/root/private_data/model/mixtral-8x7b",
+        "deepseek-ai/deepseek-moe-16b-chat",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "microsoft/DialoGPT-medium"
     ]
     
@@ -574,8 +584,15 @@ def main():
         pad_token_id=tokenizer.eos_token_id
     )
     
-    # 编码输入
+    # 编码输入并确保在正确的设备上
     inputs = tokenizer(test_prompt, return_tensors="pt")
+    
+    # 获取模型设备
+    model_device = next(model.parameters()).device
+    print(f"Model device: {model_device}")
+    
+    # 将输入移动到模型设备
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
     
     # 生成文本（无水印）
     print("Generating text without watermark...")

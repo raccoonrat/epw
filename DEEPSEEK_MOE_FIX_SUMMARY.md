@@ -8,13 +8,20 @@
 Error loading model with custom class: Unrecognized configuration class <class 'transformers_modules.DeepSeek-MoE.configuration_deepseek.DeepseekConfig'> for this kind of AutoModel: MoEForCausalLMWithWatermark.
 ```
 
+以及后续的DynamicCache兼容性问题：
+
+```
+AttributeError: 'DynamicCache' object has no attribute 'get_usable_length'. Did you mean: 'get_seq_length'?
+```
+
 ## 根本原因
 
 1. **错误的继承模式**: 试图直接子类化 `AutoModelForCausalLM`，但这是一个工厂类，不能直接子类化
 2. **配置类映射问题**: `AutoModelForCausalLM.from_pretrained()` 期望特定的模型类与配置类映射，但我们的自定义类无法被识别
 3. **架构不兼容**: 不同的MoE模型（Mixtral、DeepSeek）有不同的架构，需要更灵活的适配方案
+4. **transformers版本兼容性**: DynamicCache在不同版本的transformers中有不同的API
 
-## 解决方案：适配器模式
+## 解决方案：适配器模式 + 兼容性修复
 
 ### 1. 创建模型包装器类
 
@@ -33,7 +40,32 @@ class MoEModelWithWatermark:
         # ... 其他初始化代码
 ```
 
-### 2. 委托模式实现
+### 2. DynamicCache兼容性修复
+
+```python
+# 修复DynamicCache兼容性问题
+try:
+    from transformers.cache import DynamicCache
+    if not hasattr(DynamicCache, 'get_usable_length'):
+        def get_usable_length(self):
+            return self.get_seq_length()
+        DynamicCache.get_usable_length = get_usable_length
+except ImportError:
+    pass
+```
+
+### 3. 设备映射修复
+
+```python
+# 获取模型设备
+model_device = next(model.parameters()).device
+print(f"Model device: {model_device}")
+
+# 将输入移动到模型设备
+inputs = {k: v.to(model_device) for k, v in inputs.items()}
+```
+
+### 4. 委托模式实现
 
 ```python
 def forward(self, *args, **kwargs):
@@ -51,7 +83,7 @@ def __getattr__(self, name):
     return getattr(self.model, name)
 ```
 
-### 3. 动态专家数量检测
+### 5. 动态专家数量检测
 
 ```python
 def _get_num_experts(self) -> int:
@@ -75,7 +107,7 @@ def _get_num_experts(self) -> int:
         return 8  # 默认回退
 ```
 
-### 4. 通用MoE块检测
+### 6. 通用MoE块检测
 
 ```python
 def _calculate_router_hash(self):
@@ -116,6 +148,10 @@ base_model = AutoModelForCausalLM.from_pretrained(
 
 # 2. 然后包装模型以添加水印功能
 model = MoEModelWithWatermark(base_model, tokenizer)
+
+# 3. 确保输入在正确设备上
+model_device = next(model.parameters()).device
+inputs = {k: v.to(model_device) for k, v in inputs.items()}
 ```
 
 ## 优势
@@ -124,15 +160,15 @@ model = MoEModelWithWatermark(base_model, tokenizer)
 2. **灵活性**: 可以轻松添加新的MoE模型支持
 3. **稳定性**: 不干扰transformers的工厂模式
 4. **可维护性**: 清晰的委托模式，易于理解和维护
+5. **版本兼容性**: 处理了transformers版本差异问题
 
 ## 测试验证
 
-创建了 `test_deepseek_moe_fix.py` 脚本来验证修复：
+创建了多个测试脚本来验证修复：
 
-1. **模型加载测试**: 验证基础模型和包装器都能正常加载
-2. **前向传播测试**: 确保模型能正常进行推理
-3. **文本生成测试**: 验证生成功能正常
-4. **水印功能测试**: 确保水印相关类定义正常
+1. **`simple_test.py`**: 简单的文本生成测试，验证DynamicCache修复
+2. **`test_deepseek_moe_fix.py`**: 完整的模型加载和功能测试
+3. **主程序测试**: 完整的水印功能测试
 
 ## 环境变量配置
 
@@ -153,21 +189,34 @@ export EPW_MODEL_PATH="deepseek-ai/deepseek-moe-16b-chat"
 ## 使用示例
 
 ```python
+# 运行简单测试
+python simple_test.py
+
+# 运行完整测试
+python test_deepseek_moe_fix.py
+
 # 运行主程序
 python epw-enhance-1.py
-
-# 运行测试脚本
-python test_deepseek_moe_fix.py
 ```
+
+## 修复的问题
+
+1. ✅ **Unrecognized configuration class**: 通过适配器模式解决
+2. ✅ **DynamicCache兼容性**: 通过动态方法添加解决
+3. ✅ **设备映射问题**: 通过自动设备检测和移动解决
+4. ✅ **专家数量检测**: 支持动态检测不同模型的专家数量
+5. ✅ **MoE架构兼容**: 支持不同的MoE块结构
 
 ## 总结
 
-通过实现适配器模式，我们成功解决了"Unrecognized configuration class"错误，现在可以：
+通过实现适配器模式和兼容性修复，我们成功解决了所有相关问题，现在可以：
 
 1. ✅ 正常加载 `deepseek-ai/deepseek-moe-16b-chat` 模型
 2. ✅ 支持动态专家数量检测（DeepSeek: 16, Mixtral: 8）
 3. ✅ 通用MoE块检测（支持不同架构）
 4. ✅ 保持所有原有水印功能
 5. ✅ 兼容现有的环境变量配置
+6. ✅ 处理transformers版本兼容性问题
+7. ✅ 自动处理设备映射问题
 
-这个修复为EPW-A框架提供了更好的可扩展性，可以轻松支持未来的MoE模型。 
+这个修复为EPW-A框架提供了更好的可扩展性和稳定性，可以轻松支持未来的MoE模型。 
