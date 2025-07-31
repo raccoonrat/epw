@@ -59,7 +59,15 @@ class MockTokenizer:
         return torch.tensor([tokens])
     
     def decode(self, token_ids, skip_special_tokens=True):
-        return "模拟生成的文本: " + " ".join([f"token_{i}" for i in token_ids[0].tolist()])
+        # 确保token_ids是张量格式
+        if isinstance(token_ids, torch.Tensor):
+            if token_ids.dim() == 1:
+                token_list = token_ids.tolist()
+            else:
+                token_list = token_ids[0].tolist()
+        else:
+            token_list = token_ids
+        return "模拟生成的文本: " + " ".join([f"token_{i}" for i in token_list])
 
 class MockModel:
     def __init__(self):
