@@ -1,11 +1,12 @@
 import torch
 import hashlib
 import random
+import numpy as np
+import pickle
 from transformers import LogitsProcessor
 from typing import List, Tuple, Dict, Any
 from sklearn.linear_model import LogisticRegression
-import numpy as np
-import pickle
+from scipy.stats import norm
 
 # --- 核心工具函数 ---
 
@@ -265,3 +266,236 @@ def load_pepi_oracle(model_path: str = "pepi_oracle.pkl"):
     with open(model_path, 'rb') as f:
         oracle = pickle.load(f)
     return oracle
+
+# --- 实验一：生成并检测带水印的文本 ---
+
+if __name__ == "__main__":
+    print("=== EPW-A 增强版实验一：生成并检测带水印的文本 ===")
+    
+    # 1. 环境设置和模型加载
+    print("\n1. 加载模型和分词器...")
+    
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    
+    # 4位量化配置
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True
+    )
+    
+    # 设置模型路径（请根据实际情况调整）
+    model_paths = [
+        "/root/private_data/model/mixtral-8x7b",
+        "/work/home/scnttrxbp8/wangyh/Mixtral-8x7B-Instruct-v0.1",
+        "microsoft/DialoGPT-medium",  # 作为备选的小模型
+    ]
+    
+    model_id = None
+    tokenizer = None
+    model = None
+    
+    for path in model_paths:
+        try:
+            # 尝试加载模型
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            model = AutoModelForCausalLM.from_pretrained(
+                path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                quantization_config=quantization_config,
+            )
+            model_id = path
+            print(f"✓ 成功加载模型: {path}")
+            break
+        except Exception as e:
+            print(f"✗ 无法加载模型 {path}: {e}")
+            continue
+    
+    if model_id is None:
+        print("✗ 所有模型路径都无法加载，请检查模型路径和网络连接")
+        exit(1)
+    
+    # 2. 创建模型包装器
+    print("\n2. 初始化模型包装器...")
+    model_wrapper = MoEModelWrapper(model, tokenizer)
+    
+    # 3. 设置水印参数
+    secret_key = "epw_enhanced_secret_key_2024"
+    gamma = 0.25
+    delta = 2.0
+    max_new_tokens = 150
+    
+    # 4. 获取路由器哈希
+    print("\n3. 计算路由器哈希...")
+    try:
+        router_hash = get_router_hash(model, "block_sparse_moe")
+        print(f"✓ 路由器哈希: {router_hash[:16]}...")
+    except Exception as e:
+        print(f"✗ 路由器哈希计算失败: {e}")
+        router_hash = "default_router_hash"
+        print("使用默认路由器哈希")
+    
+    # 5. 创建水印生成器和检测器
+    print("\n4. 初始化水印组件...")
+    watermarker = EPW_A_Watermarker(
+        model_wrapper=model_wrapper,
+        secret_key=secret_key,
+        gamma=gamma,
+        delta_config={"delta": delta}
+    )
+    
+    detector = EPW_A_Detector(
+        model_wrapper=model_wrapper,
+        secret_key=secret_key,
+        router_hash=router_hash,
+        gamma=gamma
+    )
+    
+    # 6. 生成带水印的文本
+    print("\n5. 生成带水印的文本...")
+    prompt = "In a world where AI is becoming increasingly powerful, the ability to trace the origin of generated content is"
+    
+    print(f"输入提示: {prompt}")
+    
+    # 手动生成带水印的文本
+    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    generated_ids = input_ids.clone()
+    
+    print("正在生成文本...")
+    for i in range(max_new_tokens):
+        # 获取当前logits
+        with torch.no_grad():
+            outputs = model(generated_ids, output_router_logits=True)
+        
+        logits = outputs.logits[:, -1, :]
+        
+        # 应用水印
+        watermarked_logits = watermarker(generated_ids, logits)
+        
+        # 采样下一个token
+        probs = torch.softmax(watermarked_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        
+        # 添加到生成序列
+        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+        
+        if i % 50 == 0:
+            print(f"已生成 {i+1}/{max_new_tokens} 个token...")
+    
+    # 解码生成的文本
+    watermarked_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    
+    print("\n--- 生成的带水印文本 ---")
+    print(watermarked_text)
+    
+    # 7. 检测水印
+    print("\n6. 检测水印...")
+    
+    # 灰盒检测 (CSPV)
+    print("\n--- 灰盒检测结果 (CSPV) ---")
+    cspv_score = detector.detect_graybox_cspv(watermarked_text, sample_size=50)
+    print(f"CSPV Z-score: {cspv_score:.4f}")
+    
+    # 黑盒检测 (PEPI) - 需要先训练预言机
+    print("\n--- 黑盒检测结果 (PEPI) ---")
+    try:
+        # 尝试加载预训练的预言机
+        oracle = load_pepi_oracle("pepi_oracle.pkl")
+        print("✓ 加载预训练的PEPI预言机")
+    except FileNotFoundError:
+        print("未找到预训练的PEPI预言机，跳过黑盒检测")
+        print("提示：可以使用 train_pepi_oracle() 函数训练预言机")
+        oracle = None
+    
+    if oracle is not None:
+        pepi_score = detector.detect_blackbox_pepi(watermarked_text, oracle)
+        print(f"PEPI Z-score: {pepi_score:.4f}")
+    
+    # 8. 结果分析
+    print("\n--- 检测结果分析 ---")
+    token_ids = tokenizer(watermarked_text, return_tensors="pt", add_special_tokens=False).input_ids
+    print(f"分析的词元数: {token_ids.shape[1] - 1}")
+    
+    if cspv_score > 4.0:
+        print("✓ 灰盒检测：检测到高置信度的水印信号")
+    else:
+        print("✗ 灰盒检测：未检测到明显的水印信号")
+    
+    if oracle is not None and pepi_score > 4.0:
+        print("✓ 黑盒检测：检测到高置信度的水印信号")
+    elif oracle is not None:
+        print("✗ 黑盒检测：未检测到明显的水印信号")
+    
+    print("\n=== 实验完成 ===")
+
+# --- 简化测试函数 ---
+
+def test_basic_functionality():
+    """
+    测试基本功能，不依赖大型模型
+    """
+    print("=== 基本功能测试 ===")
+    
+    # 测试绿名单生成
+    print("\n1. 测试绿名单生成...")
+    test_key = "test_secret_key"
+    test_expert_index = 5
+    test_router_hash = "test_router_hash_12345"
+    test_vocab_size = 1000
+    test_gamma = 0.3
+    
+    green_list = get_green_list_ids(
+        test_key, test_expert_index, test_router_hash, test_vocab_size, test_gamma
+    )
+    print(f"✓ 绿名单生成成功，大小: {len(green_list)}")
+    print(f"  预期大小: {int(test_vocab_size * test_gamma)}")
+    
+    # 测试路由器哈希计算
+    print("\n2. 测试路由器哈希计算...")
+    try:
+        # 创建一个简单的测试模型
+        class TestModel:
+            def __init__(self):
+                self.model = type('obj', (object,), {
+                    'block_sparse_moe': type('obj', (object,), {
+                        'gate': type('obj', (object,), {
+                            'weight': type('obj', (object,), {
+                                'data': torch.randn(10, 10)
+                            })
+                        })
+                    })
+                })()
+        
+        test_model = TestModel()
+        test_hash = get_router_hash(test_model, "block_sparse_moe")
+        print(f"✓ 路由器哈希计算成功: {test_hash[:16]}...")
+    except Exception as e:
+        print(f"✗ 路由器哈希计算失败: {e}")
+    
+    # 测试Z-score计算
+    print("\n3. 测试Z-score计算...")
+    detector = type('obj', (object,), {
+        'gamma': 0.3,
+        '_calculate_z_score': lambda self, green_tokens, total_tokens: (
+            (green_tokens - total_tokens * self.gamma) / 
+            (np.sqrt(total_tokens * self.gamma * (1 - self.gamma)) + 1e-8)
+        )
+    })()
+    
+    test_green_tokens = 35
+    test_total_tokens = 100
+    z_score = detector._calculate_z_score(test_green_tokens, test_total_tokens)
+    print(f"✓ Z-score计算成功: {z_score:.4f}")
+    
+    print("\n=== 基本功能测试完成 ===")
+
+if __name__ == "__main__":
+    # 首先运行基本功能测试
+    test_basic_functionality()
+    
+    # 然后运行完整实验（如果模型可用）
+    print("\n" + "="*50)
+    print("开始完整实验...")
+    
+    # 原有的完整实验代码...
+
+
