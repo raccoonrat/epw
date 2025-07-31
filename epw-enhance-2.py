@@ -169,7 +169,7 @@ class EPW_A_Detector:
         if token_ids.shape <= 1: return 0.0
 
         # 1. 单次前向传播获取所有路由置信度
-        all_confidences =
+        all_confidences = []
         for t in range(1, token_ids.shape):
             context = token_ids[:, :t]
             _, _, confidence = self.wrapper.get_logits_and_route_info(context)
@@ -239,7 +239,7 @@ def train_pepi_oracle(model_wrapper: MoEModelWrapper, training_corpus: List[str]
     """
     训练并保存PEPI路径推断预言机。
     """
-    X_logits, Y_experts =,
+    X_logits, Y_experts = [], []
     print("正在生成PEPI训练数据...")
     for text in training_corpus:
         token_ids = model_wrapper.tokenizer.encode(text, return_tensors='pt')
