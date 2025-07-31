@@ -69,12 +69,23 @@ class MoEModelWrapper:
             outputs = self.model(input_ids, output_router_logits=True)
             
         logits = outputs.logits[:, -1, :]
-        router_logits = outputs.router_logits[-1][0, -1, :] # 获取最后一个MoE层的最后一个token的路由logits
         
-        probs = torch.softmax(router_logits, dim=-1)
-        top_expert_confidence, top_expert_index = torch.max(probs, dim=-1)
+        # 处理router_logits（支持模拟模式）
+        if hasattr(outputs, 'router_logits') and outputs.router_logits:
+            router_logits = outputs.router_logits[-1]
+            if router_logits.dim() == 3:
+                router_logits = router_logits[0, -1, :]
+            else:
+                router_logits = router_logits[0, :]
+            
+            probs = torch.softmax(router_logits, dim=-1)
+            top_expert_confidence, top_expert_index = torch.max(probs, dim=-1)
+        else:
+            # 模拟模式：随机选择专家
+            top_expert_index = torch.randint(0, 8, (1,)).item()
+            top_expert_confidence = torch.rand(1).item()
         
-        return logits, top_expert_index.item(), top_expert_confidence.item()
+        return logits, top_expert_index, top_expert_confidence
 
     def get_logits_blackbox(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -284,9 +295,13 @@ if __name__ == "__main__":
     
     # 设置模型路径（请根据实际情况调整）
     model_paths = [
-        "/root/private_data/model/mixtral-8x7b",
+        # 本地路径（如果需要）
+        # "/path/to/your/local/model",
+        "/root/private_data/model/mixtral-8x7b", 
         "/work/home/scnttrxbp8/wangyh/Mixtral-8x7B-Instruct-v0.1",
-        "microsoft/DialoGPT-medium",  # 作为备选的小模型
+        "microsoft/DialoGPT-small",  # 小型模型，适合测试
+        "gpt2",  # 标准GPT-2模型
+        "microsoft/DialoGPT-medium",  # 中型模型
     ]
     
     model_id = None
@@ -311,8 +326,51 @@ if __name__ == "__main__":
             continue
     
     if model_id is None:
-        print("✗ 所有模型路径都无法加载，请检查模型路径和网络连接")
-        exit(1)
+        print("✗ 所有模型路径都无法加载，切换到模拟模式...")
+        print("注意：模拟模式将使用模拟数据进行测试，不会进行实际的模型推理")
+        
+        # 创建模拟模型和分词器
+        class MockTokenizer:
+            def __init__(self):
+                self.vocab_size = 50257  # GPT-2词汇表大小
+                self.pad_token = "<|endoftext|>"
+                self.eos_token = "<|endoftext|>"
+            
+            def encode(self, text, return_tensors='pt', add_special_tokens=False):
+                # 简单的模拟编码
+                tokens = [hash(text) % self.vocab_size] + [i % self.vocab_size for i in range(len(text.split()))]
+                return torch.tensor([tokens])
+            
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "模拟生成的文本: " + " ".join([f"token_{i}" for i in token_ids[0].tolist()])
+        
+        class MockModel:
+            def __init__(self):
+                self.config = type('obj', (object,), {'vocab_size': 50257})()
+                self.device = 'cpu'
+            
+            def __call__(self, input_ids, output_router_logits=False, **kwargs):
+                # 模拟模型输出
+                batch_size, seq_len = input_ids.shape
+                vocab_size = 50257
+                
+                # 模拟logits
+                logits = torch.randn(batch_size, seq_len, vocab_size)
+                
+                # 模拟router_logits（如果请求）
+                if output_router_logits:
+                    router_logits = [torch.randn(batch_size, seq_len, 8)]  # 8个专家
+                    return type('obj', (object,), {
+                        'logits': logits,
+                        'router_logits': router_logits
+                    })()
+                else:
+                    return type('obj', (object,), {'logits': logits})()
+        
+        tokenizer = MockTokenizer()
+        model = MockModel()
+        model_id = "mock_model"
+        print("✓ 模拟模型创建成功")
     
     # 2. 创建模型包装器
     print("\n2. 初始化模型包装器...")
@@ -326,13 +384,17 @@ if __name__ == "__main__":
     
     # 4. 获取路由器哈希
     print("\n3. 计算路由器哈希...")
-    try:
-        router_hash = get_router_hash(model, "block_sparse_moe")
-        print(f"✓ 路由器哈希: {router_hash[:16]}...")
-    except Exception as e:
-        print(f"✗ 路由器哈希计算失败: {e}")
-        router_hash = "default_router_hash"
-        print("使用默认路由器哈希")
+    if model_id == "mock_model":
+        router_hash = "mock_router_hash_for_testing"
+        print(f"✓ 模拟路由器哈希: {router_hash}")
+    else:
+        try:
+            router_hash = get_router_hash(model, "block_sparse_moe")
+            print(f"✓ 路由器哈希: {router_hash[:16]}...")
+        except Exception as e:
+            print(f"✗ 路由器哈希计算失败: {e}")
+            router_hash = "default_router_hash"
+            print("使用默认路由器哈希")
     
     # 5. 创建水印生成器和检测器
     print("\n4. 初始化水印组件...")
@@ -357,7 +419,9 @@ if __name__ == "__main__":
     print(f"输入提示: {prompt}")
     
     # 手动生成带水印的文本
-    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids
+    if hasattr(model, 'device'):
+        input_ids = input_ids.to(model.device)
     generated_ids = input_ids.clone()
     
     print("正在生成文本...")
@@ -414,6 +478,10 @@ if __name__ == "__main__":
     print("\n--- 检测结果分析 ---")
     token_ids = tokenizer(watermarked_text, return_tensors="pt", add_special_tokens=False).input_ids
     print(f"分析的词元数: {token_ids.shape[1] - 1}")
+    
+    if model_id == "mock_model":
+        print("📝 注意：这是模拟模式的结果，仅用于功能测试")
+        print("   在实际模型上运行时会得到更准确的结果")
     
     if cspv_score > 4.0:
         print("✓ 灰盒检测：检测到高置信度的水印信号")
