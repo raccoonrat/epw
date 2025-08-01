@@ -289,7 +289,7 @@ class EPW_A_Detector:
         
         # 3. 对抽样点进行逐一验证
         green_token_count = 0
-        for t in sampled_indices:
+        for t, confidence in sampled_indices:
             context = token_ids[:, :t]
             _, top_expert_index, _ = self.wrapper.get_logits_and_route_info(context)
             
