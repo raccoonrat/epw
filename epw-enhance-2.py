@@ -250,11 +250,11 @@ class EPW_A_Detector:
         使用置信度分层路径验证 (CSPV) 进行高效灰盒检测。
         """
         token_ids = self.wrapper.tokenizer.encode(text, return_tensors='pt')
-        if token_ids.shape <= 1: return 0.0
+        if token_ids.shape[1] <= 1: return 0.0
 
         # 1. 单次前向传播获取所有路由置信度
         all_confidences = []
-        for t in range(1, token_ids.shape):
+        for t in range(1, token_ids.shape[1]):
             context = token_ids[:, :t]
             _, _, confidence = self.wrapper.get_logits_and_route_info(context)
             all_confidences.append((t, confidence))
@@ -292,12 +292,12 @@ class EPW_A_Detector:
         使用概率性专家路径推断 (PEPI) 进行黑盒检测。
         """
         token_ids = self.wrapper.tokenizer.encode(text, return_tensors='pt')
-        if token_ids.shape <= 1: return 0.0
+        if token_ids.shape[1] <= 1: return 0.0
 
         green_token_count = 0
-        num_tokens = token_ids.shape - 1
+        num_tokens = token_ids.shape[1] - 1
 
-        for t in range(1, token_ids.shape):
+        for t in range(1, token_ids.shape[1]):
             context = token_ids[:, :t]
             # a. 从黑盒 API 获取 Logits
             logits = self.wrapper.get_logits_blackbox(context)
@@ -327,7 +327,7 @@ def train_pepi_oracle(model_wrapper: MoEModelWrapper, training_corpus: List[str]
     print("正在生成PEPI训练数据...")
     for text in training_corpus:
         token_ids = model_wrapper.tokenizer.encode(text, return_tensors='pt')
-        for t in range(1, token_ids.shape):
+        for t in range(1, token_ids.shape[1]):
             context = token_ids[:, :t]
             logits, expert_index, _ = model_wrapper.get_logits_and_route_info(context)
             X_logits.append(logits.cpu().numpy().flatten())
