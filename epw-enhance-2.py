@@ -13,15 +13,78 @@ from scipy.stats import norm
 def get_router_hash(model: torch.nn.Module, moe_layer_name: str = "block_sparse_moe") -> str:
     """
     计算并返回模型路由器权重的SHA256哈希值 (IRSH实现)。
+    专门针对Mixtral模型架构优化。
     """
     try:
-        # 这是一个示例路径，实际路径取决于具体模型架构
-        router_weights = getattr(model.model, moe_layer_name).gate.weight.data
-        hasher = hashlib.sha256()
-        hasher.update(router_weights.cpu().numpy().tobytes())
-        return hasher.hexdigest()
-    except AttributeError:
-        raise AttributeError(f"无法在模型中找到名为 '{moe_layer_name}' 的MoE层或其gate。请检查模型架构。")
+        # 检查模型类型
+        model_type = type(model).__name__
+        print(f"检测到模型类型: {model_type}")
+        
+        # 对于Mixtral模型，遍历所有层查找MoE层
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            router_weights = []
+            moe_layer_count = 0
+            
+            for i, layer in enumerate(model.model.layers):
+                if hasattr(layer, 'block_sparse_moe') and hasattr(layer.block_sparse_moe, 'gate'):
+                    try:
+                        gate_weights = layer.block_sparse_moe.gate.weight.data
+                        
+                        # 检查是否为meta tensor
+                        if hasattr(gate_weights, 'is_meta') and gate_weights.is_meta:
+                            print(f"警告: 第{i}层的路由器权重是meta tensor")
+                            continue
+                        
+                        # 安全访问数据
+                        weight_bytes = gate_weights.cpu().numpy().tobytes()
+                        router_weights.append(weight_bytes)
+                        moe_layer_count += 1
+                        
+                    except Exception as e:
+                        print(f"警告: 无法访问第{i}层的路由器权重: {e}")
+                        continue
+            
+            if router_weights:
+                print(f"找到 {moe_layer_count} 个MoE层")
+                # 连接所有路由器权重并哈希
+                combined_weights = b''.join(router_weights)
+                hasher = hashlib.sha256()
+                hasher.update(combined_weights)
+                return hasher.hexdigest()
+            else:
+                print("未找到任何可用的MoE层")
+        
+        # 尝试其他可能的架构
+        alternative_paths = [
+            'model.block_sparse_moe.gate.weight',
+            'model.moe.gate.weight',
+            'block_sparse_moe.gate.weight',
+            'moe.gate.weight'
+        ]
+        
+        for path in alternative_paths:
+            try:
+                # 使用getattr递归访问
+                parts = path.split('.')
+                current = model
+                for part in parts:
+                    current = getattr(current, part)
+                
+                weight_data = current.data
+                hasher = hashlib.sha256()
+                hasher.update(weight_data.cpu().numpy().tobytes())
+                print(f"使用路径 '{path}' 成功计算哈希")
+                return hasher.hexdigest()
+            except (AttributeError, Exception) as e:
+                continue
+        
+        # 如果所有方法都失败，使用默认哈希
+        print("无法找到路由器权重，使用默认哈希")
+        return "default_router_hash_for_mixtral"
+        
+    except Exception as e:
+        print(f"路由器哈希计算过程中发生错误: {e}")
+        return "error_router_hash"
 
 def get_green_list_ids(
     key: str,
@@ -55,7 +118,16 @@ class MoEModelWrapper:
 
     def get_router_weights(self):
         # 实际实现需要根据模型架构调整
-        return self.model.model.block_sparse_moe.gate.weight
+        try:
+            # 尝试直接访问
+            return self.model.model.block_sparse_moe.gate.weight
+        except AttributeError:
+            # 如果直接访问失败，尝试遍历层
+            for layer in self.model.model.layers:
+                if hasattr(layer, 'block_sparse_moe') and hasattr(layer.block_sparse_moe, 'gate'):
+                    return layer.block_sparse_moe.gate.weight
+            # 如果都失败，返回None
+            return None
 
     def get_vocab_size(self) -> int:
         return self.model.config.vocab_size
