@@ -137,6 +137,14 @@ class MoEModelWrapper:
         执行一次前向传播，返回logits、top-1专家索引和其置信度。
         这是灰盒访问的核心。
         """
+        # 确保输入张量在正确的设备上
+        if hasattr(self.model, 'device'):
+            device = self.model.device
+        else:
+            device = next(self.model.parameters()).device
+        
+        input_ids = input_ids.to(device)
+        
         with torch.no_grad():
             outputs = self.model(input_ids, output_router_logits=True)
             
@@ -163,6 +171,14 @@ class MoEModelWrapper:
         """
         模拟黑盒API，只返回logits。
         """
+        # 确保输入张量在正确的设备上
+        if hasattr(self.model, 'device'):
+            device = self.model.device
+        else:
+            device = next(self.model.parameters()).device
+        
+        input_ids = input_ids.to(device)
+        
         with torch.no_grad():
             outputs = self.model(input_ids)
         return outputs.logits[:, -1, :]
