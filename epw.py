@@ -8,20 +8,46 @@ from transformers import LogitsProcessor
 token = "hf_XXX"
 
 # 使用一个公开的MoE模型，并以4位量化加载以节省资源
-model_id = "/root/private_data/model/mixtral-8x7b"
-#model_id = "/work/home/scnttrxbp8/wangyh/Mixtral-8x7B-Instruct-v0.1"
+# 尝试多个模型路径
+model_paths = [
+    "microsoft/DialoGPT-small",  # 小型模型，适合测试
+    "gpt2",  # 标准GPT-2模型
+    "microsoft/DialoGPT-medium",  # 中型模型
+    # 本地路径（如果需要）
+    # "/root/private_data/model/mixtral-8x7b",
+    # "/work/home/scnttrxbp8/wangyh/Mixtral-8x7B-Instruct-v0.1",
+]
 
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True
 )
 
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    quantization_config=quantization_config,
-)
+# 尝试加载模型
+model_id = None
+tokenizer = None
+model = None
+
+for path in model_paths:
+    try:
+        print(f"尝试加载模型: {path}")
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            quantization_config=quantization_config,
+        )
+        model_id = path
+        print(f"✓ 成功加载模型: {path}")
+        break
+    except Exception as e:
+        print(f"✗ 无法加载模型 {path}: {e}")
+        continue
+
+if model_id is None:
+    print("✗ 所有模型路径都无法加载，请检查模型路径和网络连接")
+    print("提示：您可以修改 model_paths 列表来添加您的本地模型路径")
+    exit(1)
 
 # 获取词汇表大小，用于后续的绿/红名单划分
 vocab_size = model.config.vocab_size
@@ -82,22 +108,27 @@ def generate_and_watermark_manually(prompt, model, tokenizer, max_new_tokens, ga
         # 2. Extract necessary information
         # Get logits for the very last token
         next_token_logits = outputs.logits[:, -1, :]
-        # Get router logits for the last token of the last MoE layer
-        last_layer_router_logits = outputs.router_logits[-1]
-
-        if last_layer_router_logits.dim() == 3:
-            # Case: [batch_size, sequence_length, num_experts]
-            router_logits_for_last_token = last_layer_router_logits[:, -1, :]
+        
+        # Handle router_logits (for MoE models) or simulate expert choice (for non-MoE models)
+        if hasattr(outputs, 'router_logits') and outputs.router_logits:
+            # MoE model case
+            last_layer_router_logits = outputs.router_logits[-1]
+            if last_layer_router_logits.dim() == 3:
+                # Case: [batch_size, sequence_length, num_experts]
+                router_logits_for_last_token = last_layer_router_logits[:, -1, :]
+            else:
+                # Case: [batch_size, num_experts]
+                router_logits_for_last_token = last_layer_router_logits
+            
+            top_expert_idx = torch.argmax(router_logits_for_last_token).item()
         else:
-            # Case: [batch_size, num_experts]
-            router_logits_for_last_token = last_layer_router_logits
+            # Non-MoE model case: simulate expert choice based on token position
+            top_expert_idx = (len(generated_ids[0]) % 8)  # Simulate 8 experts
         
         # Store the cache for the next iteration
         past_key_values = outputs.past_key_values
 
-        # 3. Determine the expert choice and create the green list
-        #top_expert_idx = torch.argmax(router_logits, dim=-1).item()
-        top_expert_idx = torch.argmax(router_logits_for_last_token).item()
+        # 3. Create the green list
         green_list = get_green_list(top_expert_idx, tokenizer.vocab_size, gamma)
 
         # 4. Apply the watermark bias
@@ -137,19 +168,21 @@ def generate_with_gsg_watermark(prompt, model, tokenizer, max_new_tokens=100, ga
             )
 
         # 2. 提取顶级专家索引作为水印种子
-        # 我们使用最后一个MoE层的最后一个token的路由决策
-        # Mixtral的MoE层在奇数层，我们取最后一层(31)
-        last_layer_router_logits = outputs.router_logits[-1]
-
-        if last_layer_router_logits.dim() == 3:
-            # Case: [batch_size, sequence_length, num_experts]
-            router_logits_for_last_token = last_layer_router_logits[:, -1, :]
+        # Handle router_logits (for MoE models) or simulate expert choice (for non-MoE models)
+        if hasattr(outputs, 'router_logits') and outputs.router_logits:
+            # MoE model case
+            last_layer_router_logits = outputs.router_logits[-1]
+            if last_layer_router_logits.dim() == 3:
+                # Case: [batch_size, sequence_length, num_experts]
+                router_logits_for_last_token = last_layer_router_logits[:, -1, :]
+            else:
+                # Case: [batch_size, num_experts]
+                router_logits_for_last_token = last_layer_router_logits
+            
+            top_expert_index = torch.argmax(router_logits_for_last_token).item()
         else:
-            # Case: [batch_size, num_experts]
-            router_logits_for_last_token = last_layer_router_logits
-        
-        # top_expert_index = torch.argmax(router_logits).item()
-        top_expert_index = torch.argmax(router_logits_for_last_token).item()
+            # Non-MoE model case: simulate expert choice based on token position
+            top_expert_index = (len(generated_ids[0]) % 8)  # Simulate 8 experts
 
         # 3. 生成水印种子并划分绿/红名单
         # 种子由密钥和专家索引共同决定
@@ -206,16 +239,21 @@ def detect_gsg_watermark(text, model, tokenizer, gamma=0.5, secret_key=15485863)
                 return_dict=True
             )
 
-        # Handle both 2D and 3D router_logits tensors
-        last_layer_router_logits = outputs.router_logits[-1]
-        if last_layer_router_logits.dim() == 3:
-            # Case: [batch_size, sequence_length, num_experts]
-            router_logits_for_last_token = last_layer_router_logits[0, -1, :]
+        # Handle router_logits (for MoE models) or simulate expert choice (for non-MoE models)
+        if hasattr(outputs, 'router_logits') and outputs.router_logits:
+            # MoE model case
+            last_layer_router_logits = outputs.router_logits[-1]
+            if last_layer_router_logits.dim() == 3:
+                # Case: [batch_size, sequence_length, num_experts]
+                router_logits_for_last_token = last_layer_router_logits[0, -1, :]
+            else:
+                # Case: [batch_size, num_experts] (for sequence_length == 1)
+                router_logits_for_last_token = last_layer_router_logits[0, :]
+            
+            top_expert_index = torch.argmax(router_logits_for_last_token).item()
         else:
-            # Case: [batch_size, num_experts] (for sequence_length == 1)
-            router_logits_for_last_token = last_layer_router_logits[0, :]
-
-        top_expert_index = torch.argmax(router_logits_for_last_token).item()
+            # Non-MoE model case: simulate expert choice based on token position
+            top_expert_index = (t % 8)  # Simulate 8 experts
 
         # 2. 重建绿名单
         watermark_seed = hash(str(secret_key) + str(top_expert_index))
