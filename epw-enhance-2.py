@@ -362,7 +362,9 @@ if __name__ == "__main__":
     
     # 4位量化配置
     quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype="float16"
     )
     
     # 设置模型路径（请根据实际情况调整）
